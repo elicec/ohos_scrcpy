@@ -1,0 +1,22 @@
+# Build output
+dist/
+client/build/
+server/build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiler output
+*.o
+*.o.d
+
+# Executables
+ohos_scrcpy
+ohos_scrcpy_server
+ohos_scrcpy_server_stub
+a.out

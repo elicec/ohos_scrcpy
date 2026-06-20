@@ -1,0 +1,41 @@
+# OHOS Scrcpy 服务端 - OpenHarmony 构建配置
+# 将此文件放入 OpenHarmony 源码树中进行编译
+
+import("//build/ohos.gni")
+
+ohos_executable("ohos_scrcpy_server") {
+    sources = [
+        "src/main.c",
+        "src/screen_capture.c",
+        "src/video_encoder.c",
+        "src/input_injector.c",
+        "src/tcp_server.c",
+    ]
+
+    include_dirs = [
+        "include",
+        "//common",
+        "//foundation/multimedia/player_framework/interfaces/inner_api/native",
+        "//foundation/window/window_manager/interfaces/innerkits/native",
+        "//foundation/window/window_manager/interfaces/kits/native",
+        "//foundation/multimedia/player_framework/frameworks/native/avscreencapture",
+    ]
+
+    deps = [
+        "//foundation/multimedia/player_framework:av_screen_capture",
+        "//foundation/multimedia/player_framework:video_encoder",
+        "//foundation/window/window_manager:libdm",
+    ]
+
+    external_deps = [
+        "c_utils:utils",
+        "hilog:libhilog",
+        "input:oh_input",
+    ]
+
+    # 以 shell 权限运行
+    subsystem_name = "multimedia"
+    part_name = "player_framework"
+
+    install_enable = false
+}
