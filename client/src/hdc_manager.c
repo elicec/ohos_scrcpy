@@ -28,6 +28,7 @@
 #define SERVER_REMOTE_PATH "/data/local/tmp/ohos_scrcpy_server"
 
 static HdcManagerConfig g_hdcConfig = {0};
+static char g_serverSerial[128] = {0};
 
 #ifdef _WIN32
 static int execute_hdc_command(const char *serial, const char *args,
@@ -273,13 +274,19 @@ int hdc_manager_start_server(const char *serial, uint16_t videoPort,
 
     hdc_manager_shell(serial, "chmod +x " SERVER_REMOTE_PATH, NULL, 0);
 
-    char cmd[512];
+    /* 先 kill 旧的服务端进程，避免残留 */
+    hdc_manager_stop_server(serial);
+
+    /* 启动服务端，让进程将 PID 写入文件，便于后续 kill */
+    char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "nohup " SERVER_REMOTE_PATH " -v %u -c %u -s %.2f -b %u -f %u > /dev/null 2>&1 &",
-             videoPort, controlPort, scale, bitrate, fps);
+             "nohup %s -v %u -c %u -s %.2f -b %u -f %u > /dev/null 2>&1 & echo $!",
+             SERVER_REMOTE_PATH, videoPort, controlPort, scale, bitrate, fps);
 
     LOG_TAG_I(HDC_TAG, "Starting server: %s", cmd);
-    int ret = hdc_manager_shell(serial, cmd, NULL, 0);
+
+    char output[256] = {0};
+    int ret = hdc_manager_shell(serial, cmd, output, sizeof(output));
     if (ret != 0) {
         LOG_TAG_E(HDC_TAG, "Failed to start server");
         return -1;
@@ -287,16 +294,91 @@ int hdc_manager_start_server(const char *serial, uint16_t videoPort,
 
     SLEEP_MS(2000);
 
-    LOG_TAG_I(HDC_TAG, "Server started on device");
+    /* 保存当前 serial 供 stop_server 使用 */
+    strncpy(g_serverSerial, serial, sizeof(g_serverSerial) - 1);
+
+    LOG_TAG_I(HDC_TAG, "Server started on device (PID output: %s)", output);
     return 0;
 }
 
 int hdc_manager_stop_server(const char *serial)
 {
-    LOG_TAG_I(HDC_TAG, "Stopping server on device");
-    return hdc_manager_shell(serial,
-                             "pkill -f ohos_scrcpy_server || true",
-                             NULL, 0);
+    const char *targetSerial = serial;
+    if (targetSerial == NULL || targetSerial[0] == '\0') {
+        targetSerial = g_serverSerial;
+    }
+    if (targetSerial == NULL || targetSerial[0] == '\0') {
+        return 0;
+    }
+
+    LOG_TAG_I(HDC_TAG, "Stopping server on device %s", targetSerial);
+
+    /* 方式1：用 ps | grep 找到 PID 并 kill */
+    char output[MAX_OUTPUT_SIZE] = {0};
+    int ret = hdc_manager_shell(targetSerial,
+                                 "ps -A 2>/dev/null | grep ohos_scrcpy_server | grep -v grep",
+                                 output, sizeof(output));
+    if (ret == 0 && output[0] != '\0') {
+        LOG_TAG_I(HDC_TAG, "Found server processes: %s", output);
+        /* 解析 PID 并 kill */
+        char *saveptr = NULL;
+        char *line = strtok_r(output, "\r\n", &saveptr);
+        while (line) {
+            /* ps 输出格式通常是: PID USER ... 或 PID ... */
+            char pidStr[32] = {0};
+            int i = 0;
+            while (line[i] == ' ' || line[i] == '\t') i++;
+            int j = 0;
+            while (line[i] && line[i] != ' ' && line[i] != '\t' && j < 31) {
+                pidStr[j++] = line[i++];
+            }
+            pidStr[j] = '\0';
+
+            if (pidStr[0] != '\0') {
+                char killCmd[128];
+                snprintf(killCmd, sizeof(killCmd), "kill -9 %s 2>/dev/null", pidStr);
+                hdc_manager_shell(targetSerial, killCmd, NULL, 0);
+                LOG_TAG_I(HDC_TAG, "Sent kill -9 to PID %s", pidStr);
+            }
+            line = strtok_r(NULL, "\r\n", &saveptr);
+        }
+    }
+
+    /* 方式2：尝试 pkill */
+    hdc_manager_shell(targetSerial, "pkill -9 ohos_scrcpy_server 2>/dev/null || true",
+                      NULL, 0);
+
+    /* 方式3：尝试 killall */
+    hdc_manager_shell(targetSerial, "killall -9 ohos_scrcpy_server 2>/dev/null || true",
+                      NULL, 0);
+
+    /* 方式4：通过 PID 文件 kill（如果有） */
+    hdc_manager_shell(targetSerial,
+                      "if [ -f /data/local/tmp/ohos_scrcpy.pid ]; then "
+                      "kill -9 $(cat /data/local/tmp/ohos_scrcpy.pid) 2>/dev/null; "
+                      "rm -f /data/local/tmp/ohos_scrcpy.pid; fi",
+                      NULL, 0);
+
+    SLEEP_MS(500);
+
+    /* 确认是否还有残留 */
+    char verify[256] = {0};
+    hdc_manager_shell(targetSerial,
+                      "ps -A 2>/dev/null | grep ohos_scrcpy_server | grep -v grep | wc -l",
+                      verify, sizeof(verify));
+    int remaining = atoi(verify);
+    if (remaining > 0) {
+        LOG_TAG_W(HDC_TAG, "Warning: %d server process(es) still running", remaining);
+    } else {
+        LOG_TAG_I(HDC_TAG, "Server stopped successfully");
+    }
+
+    /* 清除保存的 serial */
+    if (targetSerial == g_serverSerial) {
+        g_serverSerial[0] = '\0';
+    }
+
+    return 0;
 }
 
 int hdc_manager_forward_port(const char *serial, uint16_t localPort,
