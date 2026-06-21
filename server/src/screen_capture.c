@@ -64,31 +64,63 @@ static void on_video_buffer_available(OH_AVScreenCapture *capture, bool isReady)
     frame.height = g_captureCtx.actualHeight;
     frame.timestamp = (uint64_t)timestamp;
 
-    /* 获取 NativeBuffer 的实际配置（stride、format 等） */
+    /* 获取 NativeBuffer 的实际配置 */
     OH_NativeBuffer_Config bufConfig;
     OH_NativeBuffer_GetConfig(buffer, &bufConfig);
-    frame.stride = (uint32_t)bufConfig.stride;
 
-    /* 映射 NativeBuffer 获取像素数据 */
+    /* 映射 NativeBuffer。
+     * 优先尝试 OH_NativeBuffer_MapPlanes（since 12），可获取真实 rowStride；
+     * 旧版本系统没有该符号，则回退到 OH_NativeBuffer_Map（since 9）。 */
     void *virAddr = NULL;
-    int mapRet = OH_NativeBuffer_Map(buffer, &virAddr);
+    OH_NativeBuffer_Planes planes = {0};
+    bool usedMapPlanes = false;
+
+    typedef int32_t (*MapPlanesFunc)(OH_NativeBuffer *, void **, OH_NativeBuffer_Planes *);
+    static MapPlanesFunc mapPlanes = NULL;
+    static bool mapPlanesResolved = false;
+    if (!mapPlanesResolved) {
+        mapPlanesResolved = true;
+        mapPlanes = (MapPlanesFunc)dlsym(RTLD_DEFAULT, "OH_NativeBuffer_MapPlanes");
+        if (!mapPlanes) {
+            /* RTLD_DEFAULT 找不到时，再尝试从 libnative_buffer.so 加载 */
+            void *handle = dlopen("libnative_buffer.so", RTLD_LAZY);
+            if (handle) {
+                mapPlanes = (MapPlanesFunc)dlsym(handle, "OH_NativeBuffer_MapPlanes");
+            }
+        }
+        if (mapPlanes) {
+            LOG_TAG_I(CAPTURE_TAG, "OH_NativeBuffer_MapPlanes is available");
+        } else {
+            LOG_TAG_I(CAPTURE_TAG, "OH_NativeBuffer_MapPlanes not available, fallback to OH_NativeBuffer_Map");
+        }
+    }
+
+    int mapRet = -1;
+    if (mapPlanes) {
+        mapRet = mapPlanes(buffer, &virAddr, &planes);
+        usedMapPlanes = true;
+    } else {
+        mapRet = OH_NativeBuffer_Map(buffer, &virAddr);
+    }
     if (mapRet != 0 || virAddr == NULL) {
-        LOG_TAG_E(CAPTURE_TAG, "Failed to map NativeBuffer: ret=%d, addr=%p", mapRet, virAddr);
+        LOG_TAG_E(CAPTURE_TAG, "Failed to map NativeBuffer: ret=%d, addr=%p, mapPlanes=%d",
+                  mapRet, virAddr, usedMapPlanes);
         OH_AVScreenCapture_ReleaseVideoBuffer(capture);
         return;
     }
 
-    frame.data = (uint8_t *)virAddr;
-
-    /* 首帧打印诊断信息 */
-    static int diagCount = 0;
-    if (diagCount < 1) {
-        diagCount++;
-        LOG_TAG_I(CAPTURE_TAG, "Video buffer: %ux%u stride=%d format=%d addr=%p ts=%llu first4=[%02x %02x %02x %02x]",
-                  bufConfig.width, bufConfig.height, bufConfig.stride, bufConfig.format,
-                  virAddr, (unsigned long long)timestamp,
-                  frame.data[0], frame.data[1], frame.data[2], frame.data[3]);
+    /* 优先使用 MapPlanes 返回的真实 rowStride（字节数），它比 bufConfig.stride 更可靠。
+     * 若无法获取 MapPlanes，回退到紧凑 stride (width * 4)。
+     * 实测发现 OH_AVScreenCapture 返回的 bufConfig.stride 可能大于实际像素行字节数
+     * （例如紧凑数据仍报告 stride=2176），用其逐行拷贝反而会把下一行数据错当成
+     * 当前行 padding，导致画面倾斜。紧凑提取在 padding 为重复像素或零时也是安全的。 */
+    uint32_t widthBytes = frame.width * 4;
+    uint32_t actualStride = widthBytes; /* 默认紧凑 */
+    if (usedMapPlanes && planes.planeCount > 0 && planes.planes[0].rowStride > 0) {
+        actualStride = planes.planes[0].rowStride;
     }
+    frame.stride = actualStride;
+    frame.data = (uint8_t *)virAddr;
 
     g_captureCtx.callback(&frame, g_captureCtx.userData);
 

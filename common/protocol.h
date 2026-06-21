@@ -44,6 +44,8 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint16_t width;
     uint16_t height;
+    uint32_t stride;        /* 服务端 buffer 的行字节数（诊断用） */
+    uint32_t bufWidth;      /* 服务端 NativeBuffer 实际宽度（诊断用） */
 } RawFrameHeader;
 
 /* 视频帧头部 */

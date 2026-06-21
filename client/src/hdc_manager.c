@@ -280,7 +280,7 @@ int hdc_manager_start_server(const char *serial, uint16_t videoPort,
     /* 启动服务端，让进程将 PID 写入文件，便于后续 kill */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "nohup %s -v %u -c %u -s %.2f -b %u -f %u > /dev/null 2>&1 & echo $!",
+             "nohup %s -v %u -c %u -s %.2f -b %u -f %u > /data/local/tmp/ohos_scrcpy_server.log 2>&1 & echo $!",
              SERVER_REMOTE_PATH, videoPort, controlPort, scale, bitrate, fps);
 
     LOG_TAG_I(HDC_TAG, "Starting server: %s", cmd);

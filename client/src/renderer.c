@@ -349,8 +349,9 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
     return 0;
 }
 
-int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height)
+int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height, uint32_t stride)
 {
+    (void)stride;
     SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
 
     /* 首次收到 RGBA 帧时切换到 RGBA 模式 */
@@ -363,17 +364,9 @@ int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height)
     /* 更新 RGBA 纹理 */
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_renderCtx.texRGBA);
+
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgbaData);
-
-    GLenum glErr = glGetError();
-    if (glErr != GL_NO_ERROR) {
-        static int errCount = 0;
-        if (errCount < 3) {
-            errCount++;
-            LOG_TAG_E(RENDER_TAG, "glTexImage2D error: 0x%x", glErr);
-        }
-    }
 
     /* 渲染 */
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -395,7 +388,6 @@ int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height)
         g_renderCtx.stats.fps = g_renderCtx.fpsFrameCount;
         g_renderCtx.fpsFrameCount = 0;
         g_renderCtx.lastFpsTime = now;
-        LOG_TAG_I(RENDER_TAG, "RGBA render FPS: %u", g_renderCtx.stats.fps);
     }
 
     return 0;

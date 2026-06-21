@@ -58,6 +58,7 @@ static volatile bool g_rawRgbaMode = false;
 static uint8_t *g_rgbaBuffer = NULL;
 static int g_rgbaWidth = 0;
 static int g_rgbaHeight = 0;
+static uint32_t g_rgbaStride = 0;
 static volatile bool g_rgbaFrameReady = false;
 static pthread_mutex_t g_rgbaMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -188,32 +189,27 @@ static void on_video_frame(VideoMessageType type,
             const uint8_t *pixelData = data + sizeof(RawFrameHeader);
 
             if (pixelLen < (uint32_t)(w * h * 4)) {
-                LOG_TAG_W(MAIN_TAG, "Raw RGBA frame too small: %u < %d",
-                          pixelLen, w * h * 4);
-                return;
+                /* 数据可能包含 stride padding，检查是否匹配 stride * height */
+                uint32_t strideLen = rawHeader.stride * h;
+                if (pixelLen < strideLen) {
+                    LOG_TAG_W(MAIN_TAG, "Raw RGBA frame too small: %u < %d (compact) and %u (stride)",
+                              pixelLen, w * h * 4, strideLen);
+                    return;
+                }
             }
 
             if (!g_rawRgbaMode) {
                 g_rawRgbaMode = true;
                 LOG_TAG_I(MAIN_TAG, "Detected raw RGBA mode (no H.264 encoder on device)");
-            }
-
-            /* 首帧诊断：检查像素数据 */
-            static int rgbaFrameCount = 0;
-            rgbaFrameCount++;
-            if (rgbaFrameCount <= 3) {
-                uint32_t nonZero = 0;
-                for (uint32_t i = 0; i < 256 && i < pixelLen; i++) {
-                    if (pixelData[i] != 0) nonZero++;
-                }
-                LOG_TAG_I(MAIN_TAG, "RGBA frame #%d: %ux%u len=%u nonZero=%u/256 first4=[%02x %02x %02x %02x]",
-                          rgbaFrameCount, w, h, pixelLen, nonZero,
-                          pixelData[0], pixelData[1], pixelData[2], pixelData[3]);
+                /* 首次进入 RGBA 模式时通知主线程更新窗口尺寸 */
+                g_pendingWidth = (uint16_t)w;
+                g_pendingHeight = (uint16_t)h;
+                g_pendingVideoConfig = true;
             }
 
             /* 复制帧数据到缓冲区，由主线程渲染（避免 GL 上下文线程安全问题） */
             pthread_mutex_lock(&g_rgbaMutex);
-            uint32_t neededSize = (uint32_t)(w * h * 4);
+            uint32_t neededSize = pixelLen;
             if (g_rgbaBuffer == NULL ||
                 (uint32_t)(g_rgbaWidth * g_rgbaHeight * 4) != neededSize) {
                 free(g_rgbaBuffer);
@@ -223,6 +219,7 @@ static void on_video_frame(VideoMessageType type,
             }
             if (g_rgbaBuffer) {
                 memcpy(g_rgbaBuffer, pixelData, neededSize);
+                g_rgbaStride = rawHeader.stride;
                 g_rgbaFrameReady = true;
             }
             pthread_mutex_unlock(&g_rgbaMutex);
@@ -464,7 +461,7 @@ int main(int argc, char *argv[])
         if (g_rawRgbaMode) {
             pthread_mutex_lock(&g_rgbaMutex);
             if (g_rgbaFrameReady && g_rgbaBuffer) {
-                renderer_render_rgba_frame(g_rgbaBuffer, g_rgbaWidth, g_rgbaHeight);
+                renderer_render_rgba_frame(g_rgbaBuffer, g_rgbaWidth, g_rgbaHeight, g_rgbaStride);
                 g_rgbaFrameReady = false;
             }
             pthread_mutex_unlock(&g_rgbaMutex);

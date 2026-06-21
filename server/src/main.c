@@ -17,6 +17,9 @@
 #include "../common/log.h"
 #include "../common/protocol.h"
 
+/* 编译时检查 RawFrameHeader 大小 */
+_Static_assert(sizeof(RawFrameHeader) == 12, "RawFrameHeader must be 12 bytes");
+
 #define MAIN_TAG "Server"
 
 /* 全局运行标志 */
@@ -131,24 +134,22 @@ static void on_screen_frame(CapturedFrame *frame, void *userData)
 {
     (void)userData;
 
-    static int frameCount = 0;
-    frameCount++;
-
     if (g_encoderAvailable) {
         video_encoder_encode_frame(frame);
     } else {
         /* 无编码器可用，直接发送原始 RGBA 帧 */
-        if (frameCount <= 3 || frameCount % 60 == 0) {
-            LOG_TAG_I(MAIN_TAG, "Sending raw RGBA frame #%d: %ux%u stride=%u data=%p",
-                      frameCount, frame->width, frame->height, frame->stride, frame->data);
-        }
         RawFrameHeader rawHeader;
         rawHeader.width = (uint16_t)frame->width;
         rawHeader.height = (uint16_t)frame->height;
+        rawHeader.bufWidth = frame->width;
 
-        /* 计算实际像素数据长度（考虑 stride） */
-        uint32_t pixelDataLen = frame->stride * frame->height;
+        /* NativeBuffer 的实际 stride 可能包含对齐 padding（如 540 宽时 stride=544），
+         * 直接发送会导致客户端渲染倾斜。此处去除 padding，发送紧凑 RGBA 数据。 */
+        uint32_t compactRowBytes = frame->width * 4;
+        uint32_t srcRowBytes = frame->stride > 0 ? frame->stride : compactRowBytes;
+        uint32_t pixelDataLen = compactRowBytes * frame->height;
         uint32_t totalLen = sizeof(RawFrameHeader) + pixelDataLen;
+        rawHeader.stride = compactRowBytes;
 
         uint8_t *sendBuf = (uint8_t *)malloc(totalLen);
         if (sendBuf == NULL) {
@@ -157,24 +158,20 @@ static void on_screen_frame(CapturedFrame *frame, void *userData)
         }
 
         memcpy(sendBuf, &rawHeader, sizeof(RawFrameHeader));
-
-        /* 逐行拷贝像素数据，处理 stride 与 width*4 不一致的情况 */
-        uint32_t rowBytes = frame->width * 4;
-        if (frame->stride == rowBytes) {
-            memcpy(sendBuf + sizeof(RawFrameHeader), frame->data, pixelDataLen);
+        uint8_t *dst = sendBuf + sizeof(RawFrameHeader);
+        const uint8_t *src = frame->data;
+        if (srcRowBytes == compactRowBytes) {
+            memcpy(dst, src, pixelDataLen);
         } else {
-            uint8_t *dst = sendBuf + sizeof(RawFrameHeader);
-            const uint8_t *src = frame->data;
-            for (uint32_t y = 0; y < frame->height; y++) {
-                memcpy(dst, src, rowBytes);
-                dst += rowBytes;
-                src += frame->stride;
+            for (uint32_t row = 0; row < frame->height; row++) {
+                memcpy(dst + row * compactRowBytes,
+                       src + row * srcRowBytes,
+                       compactRowBytes);
             }
-            /* 实际发送长度调整为紧凑数据 */
-            totalLen = sizeof(RawFrameHeader) + rowBytes * frame->height;
         }
 
         tcp_server_send_video_frame(MSG_VIDEO_RAW_RGBA, sendBuf, totalLen, frame->timestamp);
+
         free(sendBuf);
     }
 }

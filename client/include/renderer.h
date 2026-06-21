@@ -47,7 +47,7 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
                           int width, int height);
 
 /* 渲染一帧(RGBA) */
-int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height);
+int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height, uint32_t stride);
 
 /* 处理 SDL 事件(非阻塞) */
 bool renderer_poll_events(void);
