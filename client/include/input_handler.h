@@ -31,6 +31,9 @@ void input_handler_update_screen_size(uint16_t width, uint16_t height);
 /* 更新窗口尺寸 */
 void input_handler_update_window_size(int windowWidth, int windowHeight);
 
+/* 更新右侧工具栏宽度（触摸坐标计算会排除该区域） */
+void input_handler_update_toolbar_width(int toolbarWidth);
+
 /* 处理鼠标事件 */
 int input_handler_process_mouse_event(int mouseX, int mouseY,
                                       int button, int action,

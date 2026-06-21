@@ -4,11 +4,13 @@
  */
 
 #include "renderer.h"
+#include "toolbar.h"
 #include "../../common/log.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdio.h>
 
 #include <SDL2/SDL.h>
 #include <GL/glew.h>
@@ -66,6 +68,7 @@ typedef struct {
     int           videoHeight;
     int           windowWidth;
     int           windowHeight;
+    int           toolbarWidth;
     bool          fullscreen;
     bool          shouldClose;
     bool          rgbaMode;
@@ -139,14 +142,15 @@ static void create_yuv_textures(void)
     }
 }
 
-/* 更新视口保持宽高比 */
+/* 更新视口保持宽高比，留出右侧工具栏空间 */
 static void update_viewport(void)
 {
-    int winW = g_renderCtx.windowWidth;
+    int winW = g_renderCtx.windowWidth - g_renderCtx.toolbarWidth;
     int winH = g_renderCtx.windowHeight;
     int vidW = g_renderCtx.videoWidth;
     int vidH = g_renderCtx.videoHeight;
 
+    if (winW <= 0) winW = g_renderCtx.windowWidth;
     if (vidW <= 0 || vidH <= 0 || winW <= 0 || winH <= 0) return;
 
     float winAspect = (float)winW / winH;
@@ -277,16 +281,23 @@ int renderer_create(const RendererConfig *config)
     return 0;
 }
 
+void renderer_set_toolbar_width(int width)
+{
+    g_renderCtx.toolbarWidth = width;
+    SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+    update_viewport();
+}
+
 int renderer_update_video_size(int width, int height)
 {
     g_renderCtx.videoWidth = width;
     g_renderCtx.videoHeight = height;
 
-    /* 根据视频宽高比调整窗口大小 */
+    /* 根据视频宽高比调整窗口大小，额外加上工具栏宽度 */
     if (width > 0 && height > 0) {
         float aspect = (float)width / height;
         int winH = g_renderCtx.windowHeight;
-        int winW = (int)(winH * aspect);
+        int winW = (int)(winH * aspect) + g_renderCtx.toolbarWidth;
 
         SDL_SetWindowSize(g_renderCtx.window, winW, winH);
         g_renderCtx.windowWidth = winW;
@@ -303,6 +314,7 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
                           int width, int height)
 {
     SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+    update_viewport();
 
     /* 更新 Y 纹理 */
     glActiveTexture(GL_TEXTURE0);
@@ -334,6 +346,7 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
     glBindVertexArray(g_renderCtx.vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+    toolbar_render();
     SDL_GL_SwapWindow(g_renderCtx.window);
 
     /* 更新 FPS 统计 */
@@ -353,6 +366,7 @@ int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height, u
 {
     (void)stride;
     SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+    update_viewport();
 
     /* 首次收到 RGBA 帧时切换到 RGBA 模式 */
     if (!g_renderCtx.rgbaMode) {
@@ -378,6 +392,7 @@ int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height, u
     glBindVertexArray(g_renderCtx.vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+    toolbar_render();
     SDL_GL_SwapWindow(g_renderCtx.window);
 
     /* 更新 FPS 统计 */
@@ -453,11 +468,90 @@ void renderer_get_stats(RenderStats *stats)
     if (stats) *stats = g_renderCtx.stats;
 }
 
+static int write_bmp(const char *path, int width, int height, const uint8_t *bgra)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        LOG_TAG_E(RENDER_TAG, "Failed to open screenshot file: %s", path);
+        return -1;
+    }
+
+    int rowSize = width * 4;
+    int paddedRowSize = (rowSize + 3) & ~3;
+    int imageSize = paddedRowSize * height;
+    int fileSize = 14 + 40 + imageSize;
+
+    /* BMP 文件头 */
+    uint8_t fileHeader[14] = {
+        'B', 'M',
+        (uint8_t)(fileSize & 0xFF), (uint8_t)((fileSize >> 8) & 0xFF),
+        (uint8_t)((fileSize >> 16) & 0xFF), (uint8_t)((fileSize >> 24) & 0xFF),
+        0, 0, 0, 0,
+        54, 0, 0, 0
+    };
+
+    /* DIB 头 BITMAPINFOHEADER */
+    uint8_t dibHeader[40] = {
+        40, 0, 0, 0,
+        (uint8_t)(width & 0xFF), (uint8_t)((width >> 8) & 0xFF),
+        (uint8_t)((width >> 16) & 0xFF), (uint8_t)((width >> 24) & 0xFF),
+        (uint8_t)(height & 0xFF), (uint8_t)((height >> 8) & 0xFF),
+        (uint8_t)((height >> 16) & 0xFF), (uint8_t)((height >> 24) & 0xFF),
+        1, 0,
+        32, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0
+    };
+
+    fwrite(fileHeader, 1, sizeof(fileHeader), fp);
+    fwrite(dibHeader, 1, sizeof(dibHeader), fp);
+
+    /* BMP 行自下而上，且需要 4 字节对齐 */
+    uint8_t padding[4] = {0};
+    for (int y = height - 1; y >= 0; y--) {
+        const uint8_t *row = bgra + y * width * 4;
+        fwrite(row, 1, rowSize, fp);
+        if (paddedRowSize > rowSize) {
+            fwrite(padding, 1, paddedRowSize - rowSize, fp);
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
 int renderer_take_screenshot(const char *path)
 {
-    /* TODO: 使用 glReadPixels 实现截图 */
-    (void)path;
-    return 0;
+    if (!path || !g_renderCtx.window) return -1;
+
+    SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+
+    int width = g_renderCtx.windowWidth;
+    int height = g_renderCtx.windowHeight;
+    if (width <= 0 || height <= 0) return -1;
+
+    uint8_t *pixels = (uint8_t *)malloc(width * height * 4);
+    if (!pixels) return -1;
+
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    /* BMP 使用 BGRA 顺序，交换 R 与 B */
+    for (int i = 0; i < width * height; i++) {
+        uint8_t tmp = pixels[i * 4 + 0];
+        pixels[i * 4 + 0] = pixels[i * 4 + 2];
+        pixels[i * 4 + 2] = tmp;
+    }
+
+    int ret = write_bmp(path, width, height, pixels);
+    free(pixels);
+
+    if (ret == 0) {
+        LOG_TAG_I(RENDER_TAG, "Screenshot saved: %s", path);
+    }
+    return ret;
 }
 
 void renderer_destroy(void)

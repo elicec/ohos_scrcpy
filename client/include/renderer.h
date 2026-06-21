@@ -37,6 +37,9 @@ typedef struct {
 /* 创建渲染器 */
 int renderer_create(const RendererConfig *config);
 
+/* 设置右侧工具栏宽度（视频渲染会避开该区域） */
+void renderer_set_toolbar_width(int width);
+
 /* 更新视频尺寸 */
 int renderer_update_video_size(int width, int height);
 

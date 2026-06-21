@@ -10,12 +10,14 @@
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "hdc_manager.h"
 #include "tcp_client.h"
 #include "video_decoder.h"
 #include "renderer.h"
 #include "input_handler.h"
+#include "toolbar.h"
 #include "../common/log.h"
 #include "../common/protocol.h"
 
@@ -247,6 +249,44 @@ static void on_control_message(const ControlHeader *header,
     (void)header; (void)data; (void)userData;
 }
 
+/* 工具栏动作处理 */
+static void handle_toolbar_action(ToolbarAction action)
+{
+    switch (action) {
+        case TOOLBAR_ACTION_BACK:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: back");
+            tcp_client_send_system_key(MSG_CTRL_BACK);
+            break;
+        case TOOLBAR_ACTION_HOME:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: home");
+            tcp_client_send_system_key(MSG_CTRL_HOME);
+            break;
+        case TOOLBAR_ACTION_POWER:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: power");
+            tcp_client_send_system_key(MSG_CTRL_POWER);
+            break;
+        case TOOLBAR_ACTION_VOLUME_UP:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: volume up");
+            tcp_client_send_system_key(MSG_CTRL_VOLUME_UP);
+            break;
+        case TOOLBAR_ACTION_VOLUME_DOWN:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: volume down");
+            tcp_client_send_system_key(MSG_CTRL_VOLUME_DOWN);
+            break;
+        case TOOLBAR_ACTION_SCREENSHOT: {
+            LOG_TAG_I(MAIN_TAG, "Toolbar: screenshot");
+            char path[256];
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            strftime(path, sizeof(path), "ohos_scrcpy_screenshot_%Y%m%d_%H%M%S.bmp", tm_info);
+            renderer_take_screenshot(path);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 /* 心跳线程 */
 static void *heartbeat_thread(void *param)
 {
@@ -381,7 +421,15 @@ int main(int argc, char *argv[])
     };
     input_handler_create(&inputConfig);
 
-    /* 10. 启动网络接收线程 */
+    /* 10. 创建右侧快捷工具栏 */
+    int winW, winH;
+    renderer_get_window_size(&winW, &winH);
+    if (toolbar_init(winW, winH) == 0) {
+        renderer_set_toolbar_width(toolbar_get_width());
+        input_handler_update_toolbar_width(toolbar_get_width());
+    }
+
+    /* 11. 启动网络接收线程 */
     tcp_client_start_video_receiver(on_video_frame, NULL);
     tcp_client_start_control_receiver(on_control_message, NULL);
 
@@ -391,8 +439,11 @@ int main(int argc, char *argv[])
 
     LOG_TAG_I(MAIN_TAG, "Ready! (Press Ctrl+C or close window to exit)");
 
-    /* 11. 主循环 */
+    /* 12. 主循环 */
     while (g_running && !renderer_should_close()) {
+        int winW, winH;
+        renderer_get_window_size(&winW, &winH);
+
         /* 处理所有 SDL 事件（窗口、输入等） */
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -403,29 +454,44 @@ int main(int argc, char *argv[])
                 case SDL_WINDOWEVENT:
                     /* 窗口事件交给渲染器处理（resize、viewport 更新） */
                     renderer_handle_event(&event);
+                    if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                        toolbar_resize(event.window.data1, event.window.data2);
+                    }
                     break;
                 case SDL_MOUSEBUTTONDOWN:
                 case SDL_MOUSEBUTTONUP: {
                     int action = (event.type == SDL_MOUSEBUTTONDOWN) ? 0 : 1;
-                    input_handler_process_mouse_event(
+                    ToolbarAction tbAction = toolbar_handle_mouse_click(
                         event.button.x, event.button.y,
-                        event.button.button, action, 0, 0);
+                        event.button.button, action);
+                    if (tbAction != TOOLBAR_ACTION_NONE && action == 0) {
+                        handle_toolbar_action(tbAction);
+                    } else if (event.button.x < winW - toolbar_get_width()) {
+                        input_handler_process_mouse_event(
+                            event.button.x, event.button.y,
+                            event.button.button, action, 0, 0);
+                    }
                     break;
                 }
                 case SDL_MOUSEMOTION: {
-                    if (event.motion.state & SDL_BUTTON_LMASK) {
-                        input_handler_process_mouse_event(
-                            event.motion.x, event.motion.y,
-                            SDL_BUTTON_LEFT, 2, 0, 0);
+                    toolbar_update_mouse(event.motion.x, event.motion.y);
+                    if (event.motion.x < winW - toolbar_get_width()) {
+                        if (event.motion.state & SDL_BUTTON_LMASK) {
+                            input_handler_process_mouse_event(
+                                event.motion.x, event.motion.y,
+                                SDL_BUTTON_LEFT, 2, 0, 0);
+                        }
                     }
                     break;
                 }
                 case SDL_MOUSEWHEEL: {
                     int mx, my;
                     SDL_GetMouseState(&mx, &my);
-                    input_handler_process_mouse_event(
-                        mx, my, 0, -1,
-                        event.wheel.x, event.wheel.y);
+                    if (mx < winW - toolbar_get_width()) {
+                        input_handler_process_mouse_event(
+                            mx, my, 0, -1,
+                            event.wheel.x, event.wheel.y);
+                    }
                     break;
                 }
                 case SDL_KEYDOWN:
@@ -467,8 +533,6 @@ int main(int argc, char *argv[])
             pthread_mutex_unlock(&g_rgbaMutex);
         }
 
-        int winW, winH;
-        renderer_get_window_size(&winW, &winH);
         input_handler_update_window_size(winW, winH);
 
         RenderStats stats;
@@ -495,6 +559,7 @@ cleanup:
     hdc_manager_remove_forward(serial, g_appConfig.videoPort);
     hdc_manager_remove_forward(serial, g_appConfig.controlPort);
 
+    toolbar_destroy();
     input_handler_destroy();
     renderer_destroy();
     video_decoder_destroy();

@@ -17,6 +17,7 @@ typedef struct {
     InputHandlerConfig config;
     int windowWidth;
     int windowHeight;
+    int toolbarWidth;
 } InputHandlerContext;
 
 static InputHandlerContext g_inputCtx = {0};
@@ -44,6 +45,11 @@ void input_handler_update_window_size(int windowWidth, int windowHeight)
     g_inputCtx.windowHeight = windowHeight;
 }
 
+void input_handler_update_toolbar_width(int toolbarWidth)
+{
+    g_inputCtx.toolbarWidth = toolbarWidth;
+}
+
 /* 将窗口坐标转换为设备屏幕坐标 */
 static void window_to_screen_coord(int winX, int winY,
                                    uint32_t *screenX, uint32_t *screenY)
@@ -54,8 +60,11 @@ static void window_to_screen_coord(int winX, int winY,
         return;
     }
 
-    /* 计算保持宽高比的渲染区域 */
-    float winAspect = (float)g_inputCtx.windowWidth / g_inputCtx.windowHeight;
+    /* 计算保持宽高比的渲染区域，排除右侧工具栏 */
+    int effectiveWinW = g_inputCtx.windowWidth - g_inputCtx.toolbarWidth;
+    if (effectiveWinW <= 0) effectiveWinW = g_inputCtx.windowWidth;
+
+    float winAspect = (float)effectiveWinW / g_inputCtx.windowHeight;
     float screenAspect = (float)g_inputCtx.config.screenWidth /
                          g_inputCtx.config.screenHeight;
 
@@ -63,10 +72,10 @@ static void window_to_screen_coord(int winX, int winY,
     if (winAspect > screenAspect) {
         renderH = g_inputCtx.windowHeight;
         renderW = (int)(renderH * screenAspect);
-        offsetX = (g_inputCtx.windowWidth - renderW) / 2;
+        offsetX = (effectiveWinW - renderW) / 2;
         offsetY = 0;
     } else {
-        renderW = g_inputCtx.windowWidth;
+        renderW = effectiveWinW;
         renderH = (int)(renderW / screenAspect);
         offsetX = 0;
         offsetY = (g_inputCtx.windowHeight - renderH) / 2;

@@ -31,6 +31,7 @@ set(CLIENT_SOURCES
     src/tcp_client.c
     src/renderer.c
     src/input_handler.c
+    src/toolbar.c
     src/video_decoder.cpp
 )
 
