@@ -244,11 +244,14 @@ int screen_capture_start(FrameCallback callback, void *userData)
     captureConfig.videoInfo.videoCapInfo.videoFrameHeight = (int32_t)g_captureCtx.actualHeight;
     captureConfig.videoInfo.videoCapInfo.videoSource = OH_VIDEO_SOURCE_SURFACE_RGBA;
 
-    /* 只配置 micCapInfo，不配 innerCapInfo，避免音频参数不兼容 */
+    /* 配置 micCapInfo 让 OH_AVScreenCapture_Init 校验通过（完全不配置或使用
+     * OH_SOURCE_INVALID 都会返回错误码 2 参数无效）。
+     * 使用 OH_MIC 会启动音频采集通道，因客户端不消费音频 buffer，
+     * ScreenCaptureServer 会持续丢帧并刷 "no client consumer the buffer" 日志，
+     * 但不影响视频采集功能。 */
     captureConfig.audioInfo.micCapInfo.audioSampleRate = 16000;
     captureConfig.audioInfo.micCapInfo.audioChannels = 2;
     captureConfig.audioInfo.micCapInfo.audioSource = OH_MIC;
-    /* innerCapInfo 保持全零（不设置），避免 "set audioSampleRate is not support" 错误 */
 
     OH_AVScreenCaptureCallback callbackStruct;
     memset(&callbackStruct, 0, sizeof(callbackStruct));
@@ -265,9 +268,6 @@ int screen_capture_start(FrameCallback callback, void *userData)
         g_captureCtx.capture = NULL;
         return -1;
     }
-
-    /* 关闭麦克风，我们只需要视频画面 */
-    OH_AVScreenCapture_SetMicrophoneEnabled(g_captureCtx.capture, false);
 
     ret = OH_AVScreenCapture_StartScreenCapture(g_captureCtx.capture);
     if (ret != 0) {
