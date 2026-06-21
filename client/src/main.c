@@ -173,7 +173,7 @@ static void on_video_frame(VideoMessageType type,
                 g_pendingWidth = config.width;
                 g_pendingHeight = config.height;
                 g_pendingVideoConfig = true;
-                input_handler_update_screen_size(config.width, config.height);
+                /* 输入坐标必须保持设备真实屏幕尺寸，不能随视频缩放尺寸变化 */
                 LOG_TAG_I(MAIN_TAG, "Video config: %ux%u @ %ufps, %ubps",
                           config.width, config.height, config.fps, config.bitrate);
             }

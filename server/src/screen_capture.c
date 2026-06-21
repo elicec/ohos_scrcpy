@@ -60,13 +60,17 @@ static void on_video_buffer_available(OH_AVScreenCapture *capture, bool isReady)
     }
 
     CapturedFrame frame = {0};
-    frame.width = g_captureCtx.actualWidth;
-    frame.height = g_captureCtx.actualHeight;
     frame.timestamp = (uint64_t)timestamp;
 
     /* 获取 NativeBuffer 的实际配置 */
     OH_NativeBuffer_Config bufConfig;
     OH_NativeBuffer_GetConfig(buffer, &bufConfig);
+    LOG_TAG_I(CAPTURE_TAG, "NativeBuffer config: %dx%d stride=%d format=%d",
+              bufConfig.width, bufConfig.height, bufConfig.stride, bufConfig.format);
+
+    /* 使用 NativeBuffer 真实尺寸，而不是请求的缩放尺寸 */
+    frame.width = (uint32_t)bufConfig.width;
+    frame.height = (uint32_t)bufConfig.height;
 
     /* 映射 NativeBuffer。
      * 优先尝试 OH_NativeBuffer_MapPlanes（since 12），可获取真实 rowStride；

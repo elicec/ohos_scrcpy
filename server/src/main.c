@@ -242,6 +242,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* 设置输入注入的屏幕坐标范围 */
+    {
+        uint32_t displayW = 0, displayH = 0;
+        screen_capture_get_display_size(&displayW, &displayH);
+        input_injector_set_screen_size(displayW, displayH);
+    }
+
     /* 2. 创建屏幕捕获器 */
     ScreenCaptureConfig captureConfig = {
         .displayId = 0,

@@ -84,6 +84,8 @@ static void window_to_screen_coord(int winX, int winY,
 
     *screenX = (uint32_t)(relX * g_inputCtx.config.screenWidth);
     *screenY = (uint32_t)(relY * g_inputCtx.config.screenHeight);
+    LOG_TAG_I(INPUT_TAG, "coord: win(%d,%d) -> screen(%u,%u)",
+              winX, winY, *screenX, *screenY);
 }
 
 int input_handler_process_mouse_event(int mouseX, int mouseY,

@@ -9,12 +9,22 @@
 #include <stdint.h>
 #include "../../common/protocol.h"
 
+/* 输入注入模式 */
+typedef enum {
+    INPUT_MODE_NONE = 0,
+    INPUT_MODE_OHINPUT,
+    INPUT_MODE_UINPUT,
+} InputMode;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* 初始化输入注入模块 */
 int input_injector_init(void);
+
+/* 设置屏幕尺寸（用于 uinput 坐标范围） */
+void input_injector_set_screen_size(uint32_t width, uint32_t height);
 
 /* 注入触摸事件 */
 int input_injector_inject_touch(const TouchEvent *event);
