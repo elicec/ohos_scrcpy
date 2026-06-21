@@ -131,8 +131,9 @@ static int read_events(const char *path)
         return -1;
     }
 
-    /* 尝试抓取设备 (非关键) */
-    int grab = 1;
+    /* 不使用 EVIOCGRAB 抓取设备，避免阻止输入服务读取事件，
+     * 允许同时监听事件流和系统正常处理触摸 */
+    int grab = 0;
     ioctl(fd, EVIOCGRAB, &grab);
 
     printf("Reading from %s...\n", path);

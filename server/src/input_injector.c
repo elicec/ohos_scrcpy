@@ -205,6 +205,35 @@ static void uinput_emit(int fd, uint16_t type, uint16_t code, int32_t value)
     }
 }
 
+/* 将一帧内的所有 input_event 打包到一次 write() 中写入，
+ * 避免分多次 write 时内核 input 缓冲区被输入服务部分读取，
+ * 导致“界面响应上一次坐标”的一帧延迟问题。 */
+static int uinput_write_events(int fd, struct input_event *events, size_t count)
+{
+    if (count == 0) return 0;
+    size_t totalLen = count * sizeof(struct input_event);
+    ssize_t ret = write(fd, events, totalLen);
+    if (ret < 0) {
+        LOG_TAG_E(INPUT_TAG, "uinput write_events failed: %s", strerror(errno));
+        return -1;
+    } else if ((size_t)ret != totalLen) {
+        LOG_TAG_E(INPUT_TAG, "uinput write_events short write: %zd/%zu", ret, totalLen);
+        return -1;
+    }
+    return 0;
+}
+
+static inline void fill_event(struct input_event *ev,
+                              uint16_t type, uint16_t code, int32_t value,
+                              const struct timeval *tv)
+{
+    memset(ev, 0, sizeof(*ev));
+    ev->type = type;
+    ev->code = code;
+    ev->value = value;
+    ev->time = *tv;
+}
+
 static void uinput_setup_touch_device(void)
 {
     int fd = g_uinput.touchFd;
@@ -220,22 +249,21 @@ static void uinput_setup_touch_device(void)
     /* 按键 - 只声明触摸屏必需的 BTN_TOUCH */
     ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH);
 
-    /* ABS 坐标轴 - 同时声明单点(X/Y)和多点(MT)坐标，匹配系统输入服务期望 */
-    ioctl(fd, UI_SET_ABSBIT, ABS_X);
-    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
+    /* ABS 坐标轴 - 仅声明多点触摸(MT)坐标轴，与真实触摸屏设备配置一致。
+     * 不声明 ABS_X/ABS_Y/ABS_MT_TOOL_TYPE，避免 OHOS 多模输入服务因检测到
+     * 单点坐标轴而走单点触摸处理路径，与 MT 协议冲突导致坐标延迟。 */
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_SLOT);
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MINOR);
     ioctl(fd, UI_SET_ABSBIT, ABS_MT_PRESSURE);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_TOOL_TYPE);
-    ioctl(fd, UI_SET_ABSBIT, ABS_MT_BLOB_ID);
 
     struct uinput_setup setup;
     memset(&setup, 0, sizeof(setup));
-    setup.id.bustype = BUS_VIRTUAL;
+    /* 使用 BUS_I2C 匹配真实触摸屏设备，避免 OHOS 多模输入服务
+     * 对 BUS_VIRTUAL 设备走特殊/延迟处理路径 */
+    setup.id.bustype = BUS_I2C;
     setup.id.vendor  = 0x0000;
     setup.id.product = 0x0000;
     setup.id.version = 1;
@@ -244,16 +272,6 @@ static void uinput_setup_touch_device(void)
     /* 设置 ABS 范围 */
     struct uinput_abs_setup absSetup;
     memset(&absSetup, 0, sizeof(absSetup));
-
-    absSetup.code = ABS_X;
-    absSetup.absinfo.minimum = 0;
-    absSetup.absinfo.maximum = g_uinput.screenWidth > 0 ? g_uinput.screenWidth : 1080;
-    ioctl(fd, UI_ABS_SETUP, &absSetup);
-
-    absSetup.code = ABS_Y;
-    absSetup.absinfo.minimum = 0;
-    absSetup.absinfo.maximum = g_uinput.screenHeight > 0 ? g_uinput.screenHeight : 1920;
-    ioctl(fd, UI_ABS_SETUP, &absSetup);
 
     absSetup.code = ABS_MT_SLOT;
     absSetup.absinfo.maximum = 9;
@@ -279,24 +297,9 @@ static void uinput_setup_touch_device(void)
     absSetup.absinfo.maximum = 255;
     ioctl(fd, UI_ABS_SETUP, &absSetup);
 
-    absSetup.code = ABS_MT_TOUCH_MINOR;
-    absSetup.absinfo.minimum = 0;
-    absSetup.absinfo.maximum = 255;
-    ioctl(fd, UI_ABS_SETUP, &absSetup);
-
     absSetup.code = ABS_MT_PRESSURE;
     absSetup.absinfo.minimum = 0;
     absSetup.absinfo.maximum = 255;
-    ioctl(fd, UI_ABS_SETUP, &absSetup);
-
-    absSetup.code = ABS_MT_TOOL_TYPE;
-    absSetup.absinfo.minimum = 0;
-    absSetup.absinfo.maximum = 1;
-    ioctl(fd, UI_ABS_SETUP, &absSetup);
-
-    absSetup.code = ABS_MT_BLOB_ID;
-    absSetup.absinfo.minimum = 0;
-    absSetup.absinfo.maximum = 65535;
     ioctl(fd, UI_ABS_SETUP, &absSetup);
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) {
@@ -411,48 +414,67 @@ static int uinput_inject_touch(const TouchEvent *event)
 
     LOG_TAG_I(INPUT_TAG, "inject touch action=%u x=%d y=%d", event->action, x, y);
 
+    /* 一帧内所有事件使用同一时间戳，并打包到一次 write() 中写入，
+     * 确保内核 input 子系统能原子地看到本帧全部事件，避免输入服务
+     * 读取到“半成品”帧而回退使用上一帧坐标。 */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    struct input_event ev[20];
+    size_t n = 0;
+
     switch (event->action) {
         case PROTO_TOUCH_DOWN:
             g_uinput.touching = true;
-            uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-            uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++);
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_X, x);
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_X, x);
-            uinput_emit(fd, EV_ABS, ABS_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 40);
-            uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MINOR, 40);
-            uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
-            uinput_emit(fd, EV_ABS, ABS_MT_TOOL_TYPE, 0);
-            uinput_emit(fd, EV_KEY, BTN_TOUCH, 1);
+            /* DOWN 前先发一帧重置 slot 的所有 ABS 值（TRACKING_ID=-1 + 坐标归零 + SYN_REPORT）。
+             * 内核 input 子系统会对未变化的 ABS 值去重（input_handle_abs_event），
+             * 导致用户空间 getevent 看不到该事件。若上一次触摸的某个坐标与本次相同，
+             * 该坐标事件会被丢弃，OHOS 多模输入服务拿不到当前帧坐标，回退使用上一帧坐标，
+             * 表现为"界面响应上一次坐标位置"的一帧延迟。
+             * 将坐标归零后，下一次 DOWN 设置实际坐标时值必然变化，内核会重新上报。 */
+            fill_event(&ev[n++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TRACKING_ID, -1, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_X, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_Y, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TOUCH_MAJOR, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_PRESSURE, 0, &tv);
+            fill_event(&ev[n++], EV_SYN, SYN_REPORT, 0, &tv);
+            /* 新触摸序列开始 */
+            fill_event(&ev[n++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_X, x, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_Y, y, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TOUCH_MAJOR, 40, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_PRESSURE, 80, &tv);
+            fill_event(&ev[n++], EV_KEY, BTN_TOUCH, 1, &tv);
             break;
         case PROTO_TOUCH_MOVE:
             if (!g_uinput.touching) return 0;
-            uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_X, x);
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_X, x);
-            uinput_emit(fd, EV_ABS, ABS_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_X, x, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_Y, y, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_PRESSURE, 80, &tv);
             break;
         case PROTO_TOUCH_UP:
             g_uinput.touching = false;
-            uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-            uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-            /* UP 事件也带上最终坐标，防止某些输入服务复用上一次触摸的坐标 */
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_X, x);
-            uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_X, x);
-            uinput_emit(fd, EV_ABS, ABS_Y, y);
-            uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-            uinput_emit(fd, EV_KEY, BTN_TOUCH, 0);
+            /* UP 时将坐标/触摸面积归零，确保下一次 DOWN 时这些值必然变化，
+             * 内核不会因去重而丢弃坐标事件。TRACKING_ID=-1 表示 slot 无触摸，
+             * 输入服务会忽略 POSITION 等值，归零不会产生误触摸。 */
+            fill_event(&ev[n++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TRACKING_ID, -1, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_X, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_POSITION_Y, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_TOUCH_MAJOR, 0, &tv);
+            fill_event(&ev[n++], EV_ABS, ABS_MT_PRESSURE, 0, &tv);
+            fill_event(&ev[n++], EV_KEY, BTN_TOUCH, 0, &tv);
             break;
         default:
             return -1;
     }
 
-    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
-    return 0;
+    fill_event(&ev[n++], EV_SYN, SYN_REPORT, 0, &tv);
+
+    return uinput_write_events(fd, ev, n);
 }
 
 static int uinput_inject_key(int32_t keyCode, int32_t keyAction)
@@ -460,10 +482,17 @@ static int uinput_inject_key(int32_t keyCode, int32_t keyAction)
     if (!g_uinput.keyAvailable || g_uinput.keyFd < 0) return -1;
 
     int value = (keyAction == NDK_KEY_DOWN) ? 1 : 0;
-    uinput_emit(g_uinput.keyFd, EV_KEY, keyCode, value);
-    uinput_emit(g_uinput.keyFd, EV_SYN, SYN_REPORT, 0);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    struct input_event ev[2];
+    fill_event(&ev[0], EV_KEY, keyCode, value, &tv);
+    fill_event(&ev[1], EV_SYN, SYN_REPORT, 0, &tv);
+
+    int ret = uinput_write_events(g_uinput.keyFd, ev, 2);
     LOG_TAG_I(INPUT_TAG, "inject key code=%d action=%d", keyCode, value);
-    return 0;
+    return ret;
 }
 
 static int uinput_inject_scroll(const ScrollEvent *event)
@@ -477,34 +506,50 @@ static int uinput_inject_scroll(const ScrollEvent *event)
     if (endY > (int)g_uinput.screenHeight) endY = (int)g_uinput.screenHeight;
 
     int fd = g_uinput.touchFd;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
 
-    /* DOWN */
-    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++);
-    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_X, startX);
-    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, startY);
-    uinput_emit(fd, EV_ABS, ABS_X, startX);
-    uinput_emit(fd, EV_ABS, ABS_Y, startY);
-    uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 40);
-    uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MINOR, 40);
-    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
-    uinput_emit(fd, EV_ABS, ABS_MT_TOOL_TYPE, 0);
-    uinput_emit(fd, EV_KEY, BTN_TOUCH, 1);
-    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
+    /* DOWN 帧 - 先 reset slot 的所有 ABS 值再开始新触摸，强制内核刷新坐标 */
+    struct input_event evDown[20];
+    size_t nDown = 0;
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_TRACKING_ID, -1, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_POSITION_X, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_POSITION_Y, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_TOUCH_MAJOR, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_PRESSURE, 0, &tv);
+    fill_event(&evDown[nDown++], EV_SYN, SYN_REPORT, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_POSITION_X, startX, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_POSITION_Y, startY, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_TOUCH_MAJOR, 40, &tv);
+    fill_event(&evDown[nDown++], EV_ABS, ABS_MT_PRESSURE, 80, &tv);
+    fill_event(&evDown[nDown++], EV_KEY, BTN_TOUCH, 1, &tv);
+    fill_event(&evDown[nDown++], EV_SYN, SYN_REPORT, 0, &tv);
+    if (uinput_write_events(fd, evDown, nDown) != 0) return -1;
 
-    /* MOVE */
-    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, endY);
-    uinput_emit(fd, EV_ABS, ABS_Y, endY);
-    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
-    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
+    /* MOVE 帧 */
+    struct input_event evMove[6];
+    size_t nMove = 0;
+    fill_event(&evMove[nMove++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+    fill_event(&evMove[nMove++], EV_ABS, ABS_MT_POSITION_Y, endY, &tv);
+    fill_event(&evMove[nMove++], EV_ABS, ABS_MT_PRESSURE, 80, &tv);
+    fill_event(&evMove[nMove++], EV_SYN, SYN_REPORT, 0, &tv);
+    if (uinput_write_events(fd, evMove, nMove) != 0) return -1;
 
-    /* UP */
-    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    uinput_emit(fd, EV_KEY, BTN_TOUCH, 0);
-    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
+    /* UP 帧 - 坐标归零，避免下次触摸坐标被去重 */
+    struct input_event evUp[10];
+    size_t nUp = 0;
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_SLOT, 0, &tv);
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_TRACKING_ID, -1, &tv);
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_POSITION_X, 0, &tv);
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_POSITION_Y, 0, &tv);
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_TOUCH_MAJOR, 0, &tv);
+    fill_event(&evUp[nUp++], EV_ABS, ABS_MT_PRESSURE, 0, &tv);
+    fill_event(&evUp[nUp++], EV_KEY, BTN_TOUCH, 0, &tv);
+    fill_event(&evUp[nUp++], EV_SYN, SYN_REPORT, 0, &tv);
+    if (uinput_write_events(fd, evUp, nUp) != 0) return -1;
 
     return 0;
 }

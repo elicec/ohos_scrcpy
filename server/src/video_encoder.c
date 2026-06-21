@@ -39,29 +39,48 @@ static EncoderContext g_encoderCtx = {0};
 
 static const char* find_h264_encoder_name(void)
 {
-    /* 先尝试通过 Capability API 动态查询编码器名称 */
-    OH_AVCapability *cap = OH_AVCodec_GetCapability("video/avc", true);
-    if (cap) {
+    /* 先尝试通过 Capability API 动态查询系统推荐的 AVC 编码器 */
+    OH_AVCapability *cap = OH_AVCodec_GetCapability(OH_AVCODEC_MIMETYPE_VIDEO_AVC, true);
+    if (cap != NULL) {
         const char *name = OH_AVCapability_GetName(cap);
-        if (name && name[0] != '\0') {
-            LOG_TAG_I(ENCODER_TAG, "Found H.264 encoder via capability: %s", name);
+        if (name != NULL && name[0] != '\0') {
+            LOG_TAG_I(ENCODER_TAG, "Found H.264 encoder via GetCapability: %s", name);
             return name;
         }
+        LOG_TAG_W(ENCODER_TAG, "GetCapability returned cap but name is empty");
+    } else {
+        LOG_TAG_W(ENCODER_TAG, "OH_AVCodec_GetCapability(AVC, encoder) returned NULL");
     }
 
-    /* fallback: 尝试硬件类别查询 */
-    cap = OH_AVCodec_GetCapabilityByCategory("video/avc", true, HARDWARE);
-    if (cap) {
+    /* fallback 1: 尝试硬件类别查询 */
+    cap = OH_AVCodec_GetCapabilityByCategory(OH_AVCODEC_MIMETYPE_VIDEO_AVC, true, HARDWARE);
+    if (cap != NULL) {
         const char *name = OH_AVCapability_GetName(cap);
-        if (name && name[0] != '\0') {
-            LOG_TAG_I(ENCODER_TAG, "Found H.264 HW encoder via capability: %s", name);
+        if (name != NULL && name[0] != '\0') {
+            LOG_TAG_I(ENCODER_TAG, "Found H.264 HW encoder via GetCapabilityByCategory: %s", name);
             return name;
         }
+        LOG_TAG_W(ENCODER_TAG, "HW category cap returned but name is empty");
+    } else {
+        LOG_TAG_W(ENCODER_TAG, "No H.264 HARDWARE encoder available");
     }
 
-    /* 最后 fallback 到常见名称 */
-    LOG_TAG_W(ENCODER_TAG, "Capability query failed, using fallback encoder name");
-    return "video_encoder.avc";
+    /* fallback 2: 尝试软件类别查询 */
+    cap = OH_AVCodec_GetCapabilityByCategory(OH_AVCODEC_MIMETYPE_VIDEO_AVC, true, SOFTWARE);
+    if (cap != NULL) {
+        const char *name = OH_AVCapability_GetName(cap);
+        if (name != NULL && name[0] != '\0') {
+            LOG_TAG_I(ENCODER_TAG, "Found H.264 SW encoder via GetCapabilityByCategory: %s", name);
+            return name;
+        }
+        LOG_TAG_W(ENCODER_TAG, "SW category cap returned but name is empty");
+    } else {
+        LOG_TAG_W(ENCODER_TAG, "No H.264 SOFTWARE encoder available");
+    }
+
+    /* 所有 Capability 查询均失败，返回 NULL 让上层走 CreateByMime 兜底 */
+    LOG_TAG_E(ENCODER_TAG, "All H.264 capability queries failed, will try CreateByMime fallback");
+    return NULL;
 }
 
 static void on_error(OH_AVCodec *codec, int32_t errorCode, void *userData)
@@ -177,7 +196,7 @@ int video_encoder_create(const VideoEncoderConfig *config)
 
     /* 优先通过 Capability API 动态获取编码器名称，再创建 */
     const char *codecName = find_h264_encoder_name();
-    if (codecName) {
+    if (codecName != NULL) {
         g_encoderCtx.encoder = OH_VideoEncoder_CreateByName(codecName);
         if (g_encoderCtx.encoder != NULL) {
             LOG_TAG_I(ENCODER_TAG, "Encoder created by name: %s (%ux%u)", codecName,
@@ -188,12 +207,12 @@ int video_encoder_create(const VideoEncoderConfig *config)
     }
 
     /* fallback: 使用 mime type 创建 */
-    g_encoderCtx.encoder = OH_VideoEncoder_CreateByMime("video/avc");
+    g_encoderCtx.encoder = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
     if (g_encoderCtx.encoder == NULL) {
-        LOG_TAG_E(ENCODER_TAG, "Failed to create encoder by mime video/avc");
+        LOG_TAG_E(ENCODER_TAG, "Failed to create encoder by mime AVC");
         return -1;
     }
-    LOG_TAG_I(ENCODER_TAG, "Encoder created by mime video/avc (%ux%u)",
+    LOG_TAG_I(ENCODER_TAG, "Encoder created by mime AVC (%ux%u)",
               config->width, config->height);
 
     return 0;
