@@ -82,18 +82,11 @@ static void on_video_buffer_available(OH_AVScreenCapture *capture, bool isReady)
 
     /* 首帧打印诊断信息 */
     static int diagCount = 0;
-    if (diagCount < 3) {
+    if (diagCount < 1) {
         diagCount++;
-        /* 检查像素数据是否全零 */
-        uint32_t nonZeroCount = 0;
-        uint32_t checkLen = frame.stride * frame.height;
-        if (checkLen > 1024) checkLen = 1024;
-        for (uint32_t i = 0; i < checkLen; i++) {
-            if (frame.data[i] != 0) nonZeroCount++;
-        }
-        LOG_TAG_I(CAPTURE_TAG, "Video buffer: %ux%u stride=%d format=%d addr=%p ts=%llu nonZero=%u/%u first4=[%02x %02x %02x %02x]",
+        LOG_TAG_I(CAPTURE_TAG, "Video buffer: %ux%u stride=%d format=%d addr=%p ts=%llu first4=[%02x %02x %02x %02x]",
                   bufConfig.width, bufConfig.height, bufConfig.stride, bufConfig.format,
-                  virAddr, (unsigned long long)timestamp, nonZeroCount, checkLen,
+                  virAddr, (unsigned long long)timestamp,
                   frame.data[0], frame.data[1], frame.data[2], frame.data[3]);
     }
 
@@ -161,17 +154,27 @@ int screen_capture_get_display_size(uint32_t *width, uint32_t *height)
         dlclose(lib);
     }
 
-    FILE *fp = fopen("/sys/class/display/master_display/primary/modes", "r");
-    if (fp) {
-        int w = 0, h = 0;
-        if (fscanf(fp, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
-            *width = (uint32_t)w;
-            *height = (uint32_t)h;
+    /* 尝试多个 sysfs 路径获取屏幕分辨率 */
+    const char *sysfsPaths[] = {
+        "/sys/class/display/panel0/resolution",
+        "/sys/class/display/master_display/primary/modes",
+        "/sys/class/display/master_display/modes",
+        NULL
+    };
+
+    for (int i = 0; sysfsPaths[i] != NULL; i++) {
+        FILE *fp = fopen(sysfsPaths[i], "r");
+        if (fp) {
+            int w = 0, h = 0;
+            if (fscanf(fp, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                *width = (uint32_t)w;
+                *height = (uint32_t)h;
+                fclose(fp);
+                LOG_TAG_I(CAPTURE_TAG, "Display size from %s: %ux%u", sysfsPaths[i], *width, *height);
+                return 0;
+            }
             fclose(fp);
-            LOG_TAG_I(CAPTURE_TAG, "Display size from sysfs: %ux%u", *width, *height);
-            return 0;
         }
-        fclose(fp);
     }
 
     LOG_TAG_W(CAPTURE_TAG, "Using default display size: %dx%d",
