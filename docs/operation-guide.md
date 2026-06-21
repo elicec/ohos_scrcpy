@@ -42,6 +42,8 @@ ohos_scrcpy_client.exe
 |--------|------|
 | `Alt + B` | 返回键（Back） |
 | `Alt + H` | 主页键（Home） |
+| `Alt + M` | 主页键（Home，备用） |
+| `Alt + Application` | 主页键（Home，备用，部分键盘 Alt+H 被系统占用时可用） |
 | `Alt + P` | 电源键（Power） |
 | `Alt + ↑` | 音量加（Volume Up） |
 | `Alt + ↓` | 音量减（Volume Down） |

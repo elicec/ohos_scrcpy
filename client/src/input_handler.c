@@ -218,9 +218,13 @@ int input_handler_process_key_event(int keycode, int scancode,
 {
     if (!g_inputCtx.config.captureKeyboard) return 0;
 
+    LOG_TAG_I(INPUT_TAG, "key event: keycode=%d scancode=%d action=%d mods=0x%x",
+              keycode, scancode, action, mods);
+
     /* 检查快捷键 */
     ControlMessageType shortcut = input_handler_get_shortcut(keycode, mods);
     if (shortcut != MSG_CTRL_HEARTBEAT) {
+        LOG_TAG_I(INPUT_TAG, "shortcut matched: keycode=%d -> msg=%d", keycode, shortcut);
         return tcp_client_send_system_key(shortcut);
     }
 
@@ -253,8 +257,9 @@ ControlMessageType input_handler_get_shortcut(int keycode, int mods)
     if (keycode == SDLK_b && (mods & KMOD_ALT)) {
         return MSG_CTRL_BACK;
     }
-    /* Alt+h = 主页 */
-    if (keycode == SDLK_h && (mods & KMOD_ALT)) {
+    /* Alt+h / Alt+m / Alt+Application = 主页 */
+    if ((keycode == SDLK_h || keycode == SDLK_m || keycode == SDLK_APPLICATION) &&
+        (mods & KMOD_ALT)) {
         return MSG_CTRL_HOME;
     }
     /* Alt+p = 电源 */
