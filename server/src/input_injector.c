@@ -90,15 +90,19 @@ static struct {
 /* ============== uinput 状态 ============== */
 
 static struct {
-    int fd;
-    bool available;
+    int touchFd;
+    int keyFd;
+    bool touchAvailable;
+    bool keyAvailable;
     int32_t trackingId;
     uint32_t screenWidth;
     uint32_t screenHeight;
     bool touching;
 } g_uinput = {
-    .fd = -1,
-    .available = false,
+    .touchFd = -1,
+    .keyFd = -1,
+    .touchAvailable = false,
+    .keyAvailable = false,
     .trackingId = 1,
     .screenWidth = 1080,
     .screenHeight = 1920,
@@ -201,9 +205,9 @@ static void uinput_emit(int fd, uint16_t type, uint16_t code, int32_t value)
     }
 }
 
-static void uinput_setup_device(void)
+static void uinput_setup_touch_device(void)
 {
-    int fd = g_uinput.fd;
+    int fd = g_uinput.touchFd;
 
     /* 启用事件类型 */
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
@@ -305,32 +309,86 @@ static void uinput_setup_device(void)
         return;
     }
 
-    g_uinput.available = true;
-    LOG_TAG_I(INPUT_TAG, "uinput device created (%ux%u)",
+    g_uinput.touchAvailable = true;
+    LOG_TAG_I(INPUT_TAG, "uinput touch device created (%ux%u)",
               g_uinput.screenWidth, g_uinput.screenHeight);
 }
 
-static int uinput_init(void)
+static void uinput_setup_keyboard_device(void)
 {
-    if (g_uinput.fd >= 0) return 0;
+    int fd = g_uinput.keyFd;
 
-    /* 使用阻塞写，避免 O_NONBLOCK 下 write 返回 EAGAIN 导致事件/SYN_REPORT 丢失，
-     * 进而出现“旧坐标”被再次上报的现象。 */
+    /* 启用事件类型 */
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+
+    /* 声明支持常见按键（0-255），避免按键事件被内核丢弃 */
+    for (int code = 0; code < 256; code++) {
+        ioctl(fd, UI_SET_KEYBIT, code);
+    }
+
+    struct uinput_setup setup;
+    memset(&setup, 0, sizeof(setup));
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor  = 0x0000;
+    setup.id.product = 0x0000;
+    setup.id.version = 1;
+    strncpy(setup.name, "ohos-scrcpy keyboard", UINPUT_MAX_NAME_SIZE - 1);
+
+    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) {
+        LOG_TAG_E(INPUT_TAG, "uinput keyboard UI_DEV_SETUP failed: %s", strerror(errno));
+        return;
+    }
+
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        LOG_TAG_E(INPUT_TAG, "uinput keyboard UI_DEV_CREATE failed: %s", strerror(errno));
+        return;
+    }
+
+    g_uinput.keyAvailable = true;
+    LOG_TAG_I(INPUT_TAG, "uinput keyboard device created");
+}
+
+static int uinput_open_device(void)
+{
     int fd = open("/dev/uinput", O_WRONLY);
     if (fd < 0) {
         fd = open("/dev/input/uinput", O_WRONLY);
     }
     if (fd < 0) {
         LOG_TAG_W(INPUT_TAG, "Cannot open uinput device: %s", strerror(errno));
+    }
+    return fd;
+}
+
+static int uinput_init(void)
+{
+    if (g_uinput.touchFd >= 0 || g_uinput.keyFd >= 0) return 0;
+
+    /* 使用阻塞写，避免 O_NONBLOCK 下 write 返回 EAGAIN 导致事件/SYN_REPORT 丢失，
+     * 进而出现“旧坐标”被再次上报的现象。 */
+    int touchFd = uinput_open_device();
+    if (touchFd < 0) {
         return -1;
     }
 
-    g_uinput.fd = fd;
-    uinput_setup_device();
+    int keyFd = uinput_open_device();
+    if (keyFd < 0) {
+        close(touchFd);
+        return -1;
+    }
 
-    if (!g_uinput.available) {
-        close(fd);
-        g_uinput.fd = -1;
+    g_uinput.touchFd = touchFd;
+    g_uinput.keyFd = keyFd;
+
+    uinput_setup_touch_device();
+    uinput_setup_keyboard_device();
+
+    if (!g_uinput.touchAvailable && !g_uinput.keyAvailable) {
+        close(g_uinput.touchFd);
+        close(g_uinput.keyFd);
+        g_uinput.touchFd = -1;
+        g_uinput.keyFd = -1;
         return -1;
     }
 
@@ -341,9 +399,9 @@ static int uinput_init(void)
 
 static int uinput_inject_touch(const TouchEvent *event)
 {
-    if (!g_uinput.available || g_uinput.fd < 0) return -1;
+    if (!g_uinput.touchAvailable || g_uinput.touchFd < 0) return -1;
 
-    int fd = g_uinput.fd;
+    int fd = g_uinput.touchFd;
     int x = (int)event->x;
     int y = (int)event->y;
     if (x < 0) x = 0;
@@ -399,17 +457,18 @@ static int uinput_inject_touch(const TouchEvent *event)
 
 static int uinput_inject_key(int32_t keyCode, int32_t keyAction)
 {
-    if (!g_uinput.available || g_uinput.fd < 0) return -1;
+    if (!g_uinput.keyAvailable || g_uinput.keyFd < 0) return -1;
 
     int value = (keyAction == NDK_KEY_DOWN) ? 1 : 0;
-    uinput_emit(g_uinput.fd, EV_KEY, keyCode, value);
-    uinput_emit(g_uinput.fd, EV_SYN, SYN_REPORT, 0);
+    uinput_emit(g_uinput.keyFd, EV_KEY, keyCode, value);
+    uinput_emit(g_uinput.keyFd, EV_SYN, SYN_REPORT, 0);
+    LOG_TAG_I(INPUT_TAG, "inject key code=%d action=%d", keyCode, value);
     return 0;
 }
 
 static int uinput_inject_scroll(const ScrollEvent *event)
 {
-    if (!g_uinput.available || g_uinput.fd < 0) return -1;
+    if (!g_uinput.touchAvailable || g_uinput.touchFd < 0) return -1;
 
     int startX = (int)event->x;
     int startY = (int)event->y;
@@ -417,33 +476,35 @@ static int uinput_inject_scroll(const ScrollEvent *event)
     if (endY < 0) endY = 0;
     if (endY > (int)g_uinput.screenHeight) endY = (int)g_uinput.screenHeight;
 
+    int fd = g_uinput.touchFd;
+
     /* DOWN */
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_POSITION_X, startX);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_POSITION_Y, startY);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_X, startX);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_Y, startY);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 40);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_TOUCH_MINOR, 40);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_PRESSURE, 80);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_TOOL_TYPE, 0);
-    uinput_emit(g_uinput.fd, EV_KEY, BTN_TOUCH, 1);
-    uinput_emit(g_uinput.fd, EV_SYN, SYN_REPORT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, g_uinput.trackingId++);
+    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_X, startX);
+    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, startY);
+    uinput_emit(fd, EV_ABS, ABS_X, startX);
+    uinput_emit(fd, EV_ABS, ABS_Y, startY);
+    uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 40);
+    uinput_emit(fd, EV_ABS, ABS_MT_TOUCH_MINOR, 40);
+    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
+    uinput_emit(fd, EV_ABS, ABS_MT_TOOL_TYPE, 0);
+    uinput_emit(fd, EV_KEY, BTN_TOUCH, 1);
+    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
 
     /* MOVE */
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_POSITION_Y, endY);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_Y, endY);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_PRESSURE, 80);
-    uinput_emit(g_uinput.fd, EV_SYN, SYN_REPORT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_POSITION_Y, endY);
+    uinput_emit(fd, EV_ABS, ABS_Y, endY);
+    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 80);
+    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
 
     /* UP */
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_SLOT, 0);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-    uinput_emit(g_uinput.fd, EV_ABS, ABS_MT_PRESSURE, 0);
-    uinput_emit(g_uinput.fd, EV_KEY, BTN_TOUCH, 0);
-    uinput_emit(g_uinput.fd, EV_SYN, SYN_REPORT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_SLOT, 0);
+    uinput_emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+    uinput_emit(fd, EV_ABS, ABS_MT_PRESSURE, 0);
+    uinput_emit(fd, EV_KEY, BTN_TOUCH, 0);
+    uinput_emit(fd, EV_SYN, SYN_REPORT, 0);
 
     return 0;
 }
@@ -460,6 +521,7 @@ int input_injector_init(void)
 
     if (uinput_init() == 0) {
         g_inputMode = INPUT_MODE_UINPUT;
+        /* 只要触摸或键盘有一个成功，就认为 uinput 可用 */
         return 0;
     }
 
@@ -483,22 +545,23 @@ void input_injector_set_screen_size(uint32_t width, uint32_t height)
     g_uinput.screenHeight = height;
     LOG_TAG_I(INPUT_TAG, "Screen size set to %ux%u", width, height);
 
-    /* uinput 设备的 ABS 范围在创建时固定，尺寸变化后需要重建 */
-    if (g_inputMode == INPUT_MODE_UINPUT && g_uinput.fd >= 0) {
-        LOG_TAG_I(INPUT_TAG, "Recreating uinput device with new screen size");
-        if (g_uinput.available) {
-            ioctl(g_uinput.fd, UI_DEV_DESTROY);
-            g_uinput.available = false;
+    /* uinput 触摸设备的 ABS 范围在创建时固定，尺寸变化后需要重建 */
+    if (g_inputMode == INPUT_MODE_UINPUT && g_uinput.touchFd >= 0) {
+        LOG_TAG_I(INPUT_TAG, "Recreating uinput touch device with new screen size");
+        if (g_uinput.touchAvailable) {
+            ioctl(g_uinput.touchFd, UI_DEV_DESTROY);
+            g_uinput.touchAvailable = false;
         }
-        close(g_uinput.fd);
-        g_uinput.fd = -1;
+        close(g_uinput.touchFd);
+        g_uinput.touchFd = -1;
         g_uinput.touching = false;
 
-        if (uinput_init() == 0) {
-            g_inputMode = INPUT_MODE_UINPUT;
+        int touchFd = uinput_open_device();
+        if (touchFd >= 0) {
+            g_uinput.touchFd = touchFd;
+            uinput_setup_touch_device();
         } else {
-            g_inputMode = INPUT_MODE_NONE;
-            LOG_TAG_E(INPUT_TAG, "Failed to recreate uinput device");
+            LOG_TAG_E(INPUT_TAG, "Failed to recreate uinput touch device");
         }
     }
 }
@@ -532,7 +595,7 @@ int input_injector_inject_touch(const TouchEvent *event)
         return ret == 0 ? 0 : -1;
     }
 
-    if (g_uinput.available) {
+    if (g_uinput.touchAvailable) {
         return uinput_inject_touch(event);
     }
 
@@ -554,7 +617,7 @@ int input_injector_inject_key(const KeyEvent *event)
         return ohinput_inject_key_event(event->keycode, action);
     }
 
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         return uinput_inject_key(event->keycode, action);
     }
 
@@ -595,7 +658,7 @@ int input_injector_inject_scroll(const ScrollEvent *event)
         return 0;
     }
 
-    if (g_uinput.available) {
+    if (g_uinput.touchAvailable) {
         return uinput_inject_scroll(event);
     }
 
@@ -608,7 +671,7 @@ int input_injector_inject_back_key(void)
         ohinput_inject_key_event(KEYCODE_BACK, NDK_KEY_DOWN);
         return ohinput_inject_key_event(KEYCODE_BACK, NDK_KEY_UP);
     }
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         uinput_inject_key(KEY_BACK, NDK_KEY_DOWN);
         return uinput_inject_key(KEY_BACK, NDK_KEY_UP);
     }
@@ -621,7 +684,7 @@ int input_injector_inject_home_key(void)
         ohinput_inject_key_event(KEYCODE_HOME, NDK_KEY_DOWN);
         return ohinput_inject_key_event(KEYCODE_HOME, NDK_KEY_UP);
     }
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         uinput_inject_key(KEY_HOME, NDK_KEY_DOWN);
         return uinput_inject_key(KEY_HOME, NDK_KEY_UP);
     }
@@ -634,7 +697,7 @@ int input_injector_inject_power_key(void)
         ohinput_inject_key_event(KEYCODE_POWER, NDK_KEY_DOWN);
         return ohinput_inject_key_event(KEYCODE_POWER, NDK_KEY_UP);
     }
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         uinput_inject_key(KEY_POWER, NDK_KEY_DOWN);
         return uinput_inject_key(KEY_POWER, NDK_KEY_UP);
     }
@@ -647,7 +710,7 @@ int input_injector_inject_volume_up_key(void)
         ohinput_inject_key_event(KEYCODE_VOLUME_UP, NDK_KEY_DOWN);
         return ohinput_inject_key_event(KEYCODE_VOLUME_UP, NDK_KEY_UP);
     }
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         uinput_inject_key(KEY_VOLUMEUP, NDK_KEY_DOWN);
         return uinput_inject_key(KEY_VOLUMEUP, NDK_KEY_UP);
     }
@@ -660,7 +723,7 @@ int input_injector_inject_volume_down_key(void)
         ohinput_inject_key_event(KEYCODE_VOLUME_DOWN, NDK_KEY_DOWN);
         return ohinput_inject_key_event(KEYCODE_VOLUME_DOWN, NDK_KEY_UP);
     }
-    if (g_uinput.available) {
+    if (g_uinput.keyAvailable) {
         uinput_inject_key(KEY_VOLUMEDOWN, NDK_KEY_DOWN);
         return uinput_inject_key(KEY_VOLUMEDOWN, NDK_KEY_UP);
     }
@@ -675,13 +738,22 @@ void input_injector_destroy(void)
     }
     g_ohInput.available = false;
 
-    if (g_uinput.fd >= 0) {
-        if (g_uinput.available) {
-            ioctl(g_uinput.fd, UI_DEV_DESTROY);
+    if (g_uinput.touchFd >= 0) {
+        if (g_uinput.touchAvailable) {
+            ioctl(g_uinput.touchFd, UI_DEV_DESTROY);
         }
-        close(g_uinput.fd);
-        g_uinput.fd = -1;
-        g_uinput.available = false;
+        close(g_uinput.touchFd);
+        g_uinput.touchFd = -1;
+        g_uinput.touchAvailable = false;
+    }
+
+    if (g_uinput.keyFd >= 0) {
+        if (g_uinput.keyAvailable) {
+            ioctl(g_uinput.keyFd, UI_DEV_DESTROY);
+        }
+        close(g_uinput.keyFd);
+        g_uinput.keyFd = -1;
+        g_uinput.keyAvailable = false;
     }
 
     g_inputMode = INPUT_MODE_NONE;

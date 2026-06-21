@@ -132,6 +132,87 @@ int input_handler_process_mouse_event(int mouseX, int mouseY,
     return tcp_client_send_touch(&touchEvent);
 }
 
+/* 将 SDL 键码映射为 Linux input 键码（uinput 需要 Linux 键码） */
+static int sdl_keycode_to_linux_keycode(int keycode, int scancode)
+{
+    (void)scancode;
+
+    /* 字母 a-z */
+    if (keycode >= SDLK_a && keycode <= SDLK_z) {
+        switch (keycode) {
+            case SDLK_a: return 30;
+            case SDLK_b: return 48;
+            case SDLK_c: return 46;
+            case SDLK_d: return 32;
+            case SDLK_e: return 18;
+            case SDLK_f: return 33;
+            case SDLK_g: return 34;
+            case SDLK_h: return 35;
+            case SDLK_i: return 23;
+            case SDLK_j: return 36;
+            case SDLK_k: return 37;
+            case SDLK_l: return 38;
+            case SDLK_m: return 50;
+            case SDLK_n: return 49;
+            case SDLK_o: return 24;
+            case SDLK_p: return 25;
+            case SDLK_q: return 16;
+            case SDLK_r: return 19;
+            case SDLK_s: return 31;
+            case SDLK_t: return 20;
+            case SDLK_u: return 22;
+            case SDLK_v: return 47;
+            case SDLK_w: return 17;
+            case SDLK_x: return 45;
+            case SDLK_y: return 21;
+            case SDLK_z: return 44;
+        }
+    }
+
+    /* 数字 0-9 */
+    if (keycode >= SDLK_0 && keycode <= SDLK_9) {
+        switch (keycode) {
+            case SDLK_1: return 2;
+            case SDLK_2: return 3;
+            case SDLK_3: return 4;
+            case SDLK_4: return 5;
+            case SDLK_5: return 6;
+            case SDLK_6: return 7;
+            case SDLK_7: return 8;
+            case SDLK_8: return 9;
+            case SDLK_9: return 10;
+            case SDLK_0: return 11;
+        }
+    }
+
+    /* 常用功能键 */
+    switch (keycode) {
+        case SDLK_RETURN:    return 28;
+        case SDLK_ESCAPE:    return 1;
+        case SDLK_BACKSPACE: return 14;
+        case SDLK_TAB:       return 15;
+        case SDLK_SPACE:     return 57;
+        case SDLK_UP:        return 103;
+        case SDLK_DOWN:      return 108;
+        case SDLK_LEFT:      return 105;
+        case SDLK_RIGHT:     return 106;
+        case SDLK_LSHIFT:    return 42;
+        case SDLK_RSHIFT:    return 54;
+        case SDLK_LCTRL:     return 29;
+        case SDLK_RCTRL:     return 97;
+        case SDLK_LALT:      return 56;
+        case SDLK_RALT:      return 100;
+        case SDLK_PAGEUP:    return 104;
+        case SDLK_PAGEDOWN:  return 109;
+        case SDLK_HOME:      return 102;
+        case SDLK_END:       return 107;
+        case SDLK_INSERT:    return 110;
+        case SDLK_DELETE:    return 111;
+    }
+
+    return 0;
+}
+
 int input_handler_process_key_event(int keycode, int scancode,
                                     int action, int mods)
 {
@@ -151,10 +232,16 @@ int input_handler_process_key_event(int keycode, int scancode,
         default: return -1;
     }
 
+    int linuxKeycode = sdl_keycode_to_linux_keycode(keycode, scancode);
+    if (linuxKeycode == 0) {
+        LOG_TAG_W(INPUT_TAG, "Unmapped key: sdl keycode=%d scancode=%d", keycode, scancode);
+        return 0;
+    }
+
     KeyEvent keyEvent = {
         .action = (uint8_t)keyAction,
         .reserved = 0,
-        .keycode = (uint16_t)keycode,
+        .keycode = (uint16_t)linuxKeycode,
     };
 
     return tcp_client_send_key(&keyEvent);
