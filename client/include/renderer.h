@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <SDL2/SDL.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -44,8 +46,14 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
                           const uint8_t *vData, int vStride,
                           int width, int height);
 
+/* 渲染一帧(RGBA) */
+int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height);
+
 /* 处理 SDL 事件(非阻塞) */
 bool renderer_poll_events(void);
+
+/* 处理单个 SDL 事件（窗口事件、F11/ESC 等） */
+void renderer_handle_event(const SDL_Event *event);
 
 /* 切换全屏 */
 void renderer_toggle_fullscreen(void);
@@ -55,6 +63,9 @@ bool renderer_should_close(void);
 
 /* 获取窗口尺寸 */
 void renderer_get_window_size(int *width, int *height);
+
+/* 获取 SDL 窗口指针（用于主线程设置标题等） */
+SDL_Window *renderer_get_window(void);
 
 /* 获取渲染统计 */
 void renderer_get_stats(RenderStats *stats);

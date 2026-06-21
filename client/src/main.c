@@ -51,6 +51,23 @@ static AppConfig g_appConfig = {
 
 static volatile bool g_running = true;
 
+/* 是否处于原始 RGBA 模式（无编码器） */
+static volatile bool g_rawRgbaMode = false;
+
+/* RGBA 帧缓冲区（线程安全：视频接收线程写入，主线程读取渲染） */
+static uint8_t *g_rgbaBuffer = NULL;
+static int g_rgbaWidth = 0;
+static int g_rgbaHeight = 0;
+static volatile bool g_rgbaFrameReady = false;
+static pthread_mutex_t g_rgbaMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* 待处理的视频配置（视频接收线程写入，主线程读取并应用）
+ * 避免在视频线程调用 renderer_update_video_size / SDL_SetWindowSize，
+ * 这些操作必须在主线程执行，否则会破坏 GL 上下文。 */
+static volatile bool g_pendingVideoConfig = false;
+static uint16_t g_pendingWidth = 0;
+static uint16_t g_pendingHeight = 0;
+
 static void signal_handler(int sig)
 {
     (void)sig;
@@ -123,6 +140,11 @@ static void on_video_frame(VideoMessageType type,
             if (length < 8) return;
             uint32_t spsLen = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
                               ((uint32_t)data[2] << 8) | data[3];
+            /* 越界检查：确保读取 ppsLen 时不会越界 */
+            if (4 + spsLen + 4 > length) {
+                LOG_TAG_W(MAIN_TAG, "SPS/PPS invalid: spsLen=%u, length=%u", spsLen, length);
+                return;
+            }
             uint32_t ppsLen = ((uint32_t)data[4 + spsLen] << 24) |
                               ((uint32_t)data[4 + spsLen + 1] << 16) |
                               ((uint32_t)data[4 + spsLen + 2] << 8) |
@@ -145,11 +167,65 @@ static void on_video_frame(VideoMessageType type,
             if (length >= sizeof(VideoConfig)) {
                 VideoConfig config;
                 memcpy(&config, data, sizeof(config));
-                renderer_update_video_size(config.width, config.height);
+                /* 不在视频线程调用 renderer_update_video_size（内部会
+                 * SDL_SetWindowSize，破坏 GL 上下文），改为通知主线程处理 */
+                g_pendingWidth = config.width;
+                g_pendingHeight = config.height;
+                g_pendingVideoConfig = true;
                 input_handler_update_screen_size(config.width, config.height);
                 LOG_TAG_I(MAIN_TAG, "Video config: %ux%u @ %ufps, %ubps",
                           config.width, config.height, config.fps, config.bitrate);
             }
+            break;
+        }
+        case MSG_VIDEO_RAW_RGBA: {
+            if (length < sizeof(RawFrameHeader)) return;
+            RawFrameHeader rawHeader;
+            memcpy(&rawHeader, data, sizeof(RawFrameHeader));
+            int w = rawHeader.width;
+            int h = rawHeader.height;
+            uint32_t pixelLen = length - sizeof(RawFrameHeader);
+            const uint8_t *pixelData = data + sizeof(RawFrameHeader);
+
+            if (pixelLen < (uint32_t)(w * h * 4)) {
+                LOG_TAG_W(MAIN_TAG, "Raw RGBA frame too small: %u < %d",
+                          pixelLen, w * h * 4);
+                return;
+            }
+
+            if (!g_rawRgbaMode) {
+                g_rawRgbaMode = true;
+                LOG_TAG_I(MAIN_TAG, "Detected raw RGBA mode (no H.264 encoder on device)");
+            }
+
+            /* 首帧诊断：检查像素数据 */
+            static int rgbaFrameCount = 0;
+            rgbaFrameCount++;
+            if (rgbaFrameCount <= 3) {
+                uint32_t nonZero = 0;
+                for (uint32_t i = 0; i < 256 && i < pixelLen; i++) {
+                    if (pixelData[i] != 0) nonZero++;
+                }
+                LOG_TAG_I(MAIN_TAG, "RGBA frame #%d: %ux%u len=%u nonZero=%u/256 first4=[%02x %02x %02x %02x]",
+                          rgbaFrameCount, w, h, pixelLen, nonZero,
+                          pixelData[0], pixelData[1], pixelData[2], pixelData[3]);
+            }
+
+            /* 复制帧数据到缓冲区，由主线程渲染（避免 GL 上下文线程安全问题） */
+            pthread_mutex_lock(&g_rgbaMutex);
+            uint32_t neededSize = (uint32_t)(w * h * 4);
+            if (g_rgbaBuffer == NULL ||
+                (uint32_t)(g_rgbaWidth * g_rgbaHeight * 4) != neededSize) {
+                free(g_rgbaBuffer);
+                g_rgbaBuffer = (uint8_t *)malloc(neededSize);
+                g_rgbaWidth = w;
+                g_rgbaHeight = h;
+            }
+            if (g_rgbaBuffer) {
+                memcpy(g_rgbaBuffer, pixelData, neededSize);
+                g_rgbaFrameReady = true;
+            }
+            pthread_mutex_unlock(&g_rgbaMutex);
             break;
         }
     }
@@ -277,12 +353,12 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* 7. 创建视频解码器 */
+    /* 7. 创建视频解码器（RGBA 模式下可能不需要，但创建失败不退出） */
     if (video_decoder_create() != 0) {
-        LOG_TAG_E(MAIN_TAG, "Decoder create failed");
-        goto cleanup;
+        LOG_TAG_W(MAIN_TAG, "Decoder create failed (may use raw RGBA mode)");
+    } else {
+        video_decoder_set_callback(on_decoded_frame, NULL);
     }
-    video_decoder_set_callback(on_decoded_frame, NULL);
 
     /* 8. 创建渲染器 */
     RendererConfig renderConfig = {
@@ -320,13 +396,17 @@ int main(int argc, char *argv[])
 
     /* 11. 主循环 */
     while (g_running && !renderer_should_close()) {
-        if (!renderer_poll_events()) {
-            break;
-        }
-
+        /* 处理所有 SDL 事件（窗口、输入等） */
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
+                case SDL_QUIT:
+                    g_running = false;
+                    break;
+                case SDL_WINDOWEVENT:
+                    /* 窗口事件交给渲染器处理（resize、viewport 更新） */
+                    renderer_handle_event(&event);
+                    break;
                 case SDL_MOUSEBUTTONDOWN:
                 case SDL_MOUSEBUTTONUP: {
                     int action = (event.type == SDL_MOUSEBUTTONDOWN) ? 0 : 1;
@@ -353,6 +433,17 @@ int main(int argc, char *argv[])
                 }
                 case SDL_KEYDOWN:
                 case SDL_KEYUP: {
+                    /* F11/ESC 全屏切换交给渲染器处理 */
+                    if (event.type == SDL_KEYDOWN) {
+                        if (event.key.keysym.sym == SDLK_F11) {
+                            renderer_handle_event(&event);
+                            break;
+                        }
+                        if (event.key.keysym.sym == SDLK_ESCAPE) {
+                            renderer_handle_event(&event);
+                            break;
+                        }
+                    }
                     int action = (event.type == SDL_KEYDOWN) ? 0 : 1;
                     input_handler_process_key_event(
                         event.key.keysym.sym,
@@ -361,6 +452,22 @@ int main(int argc, char *argv[])
                     break;
                 }
             }
+        }
+
+        /* 在主线程中应用待处理的视频配置（GL 上下文安全） */
+        if (g_pendingVideoConfig) {
+            renderer_update_video_size(g_pendingWidth, g_pendingHeight);
+            g_pendingVideoConfig = false;
+        }
+
+        /* 在主线程中渲染 RGBA 帧（GL 上下文安全） */
+        if (g_rawRgbaMode) {
+            pthread_mutex_lock(&g_rgbaMutex);
+            if (g_rgbaFrameReady && g_rgbaBuffer) {
+                renderer_render_rgba_frame(g_rgbaBuffer, g_rgbaWidth, g_rgbaHeight);
+                g_rgbaFrameReady = false;
+            }
+            pthread_mutex_unlock(&g_rgbaMutex);
         }
 
         int winW, winH;
@@ -372,7 +479,7 @@ int main(int argc, char *argv[])
         if (stats.fps > 0) {
             char title[128];
             snprintf(title, sizeof(title), "OHOS Scrcpy - %u fps", stats.fps);
-            SDL_SetWindowTitle(SDL_GetWindowFromID(1), title);
+            SDL_SetWindowTitle(renderer_get_window(), title);
         }
 
         usleep(1000);  /* 降低 CPU 占用 */
@@ -383,6 +490,9 @@ int main(int argc, char *argv[])
 
 cleanup:
     LOG_TAG_I(MAIN_TAG, "Cleaning up...");
+
+    free(g_rgbaBuffer);
+    g_rgbaBuffer = NULL;
 
     hdc_manager_stop_server(serial);
     hdc_manager_remove_forward(serial, g_appConfig.videoPort);

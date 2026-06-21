@@ -20,6 +20,12 @@
 typedef SOCKET socket_t;
 #define INVALID_SOCK INVALID_SOCKET
 #define CLOSE_SOCKET closesocket
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef MSG_WAITALL
+#define MSG_WAITALL 0
+#endif
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -31,8 +37,14 @@ typedef int socket_t;
 #define CLOSE_SOCKET close
 #endif
 
+#ifdef _WIN32
+#define SETSOCKOPT_CAST (const char *)
+#else
+#define SETSOCKOPT_CAST (const char *)
+#endif
+
 #define NET_TAG "Client"
-#define RECV_BUF_SIZE (256 * 1024)
+#define RECV_BUF_SIZE (4 * 1024 * 1024)  /* 4MB, 足够容纳一帧原始 RGBA 数据 */
 
 typedef struct {
     socket_t videoFd;
@@ -98,7 +110,7 @@ static socket_t connect_to_server(const char *host, uint16_t port)
 
     /* 设置 TCP_NODELAY 降低延迟 */
     int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -182,6 +194,13 @@ static void *control_thread_func(void *param)
 
 int tcp_client_create(void)
 {
+#ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        LOG_TAG_E(NET_TAG, "WSAStartup failed: %d", WSAGetLastError());
+        return -1;
+    }
+#endif
     memset(&g_clientCtx, 0, sizeof(g_clientCtx));
     g_clientCtx.videoFd = INVALID_SOCK;
     g_clientCtx.controlFd = INVALID_SOCK;
@@ -360,4 +379,7 @@ void tcp_client_destroy(void)
 {
     tcp_client_disconnect();
     memset(&g_clientCtx, 0, sizeof(g_clientCtx));
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }

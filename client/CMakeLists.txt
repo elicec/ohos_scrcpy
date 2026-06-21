@@ -52,6 +52,11 @@ target_link_libraries(${PROJECT_NAME}
     Threads::Threads
 )
 
+# Windows 特定链接
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} ws2_32 opengl32)
+endif()
+
 # Linux 特定链接
 if(UNIX AND NOT APPLE)
     target_link_libraries(${PROJECT_NAME} m)

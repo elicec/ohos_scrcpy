@@ -9,14 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* OpenHarmony 视频编码 C-API */
-#include <multimedia/player_framework/video_encoder.h>
+#include <multimedia/player_framework/native_avcodec_videoencoder.h>
+#include <multimedia/player_framework/native_avcodec_base.h>
+#include <multimedia/player_framework/native_avformat.h>
+#include <multimedia/player_framework/native_avmemory.h>
+#include <multimedia/player_framework/native_avbuffer.h>
+#include <multimedia/player_framework/native_avbuffer_info.h>
+#include <multimedia/player_framework/native_avcapability.h>
 
 #define ENCODER_TAG "Encoder"
 
 typedef struct {
     VideoEncoderConfig    config;
-    OH_VideoEncoder      *encoder;
+    OH_AVCodec           *encoder;
     OH_AVCodecAsyncCallback asyncCallback;
     EncodedFrameCallback  frameCallback;
     void                 *frameUserData;
@@ -25,57 +30,76 @@ typedef struct {
     bool                  running;
     bool                  firstFrame;
     SpsPpsData            spsPps;
+    uint32_t              inputIndex;
+    OH_AVMemory          *inputData;
+    bool                  inputReady;
 } EncoderContext;
 
 static EncoderContext g_encoderCtx = {0};
 
-/* 查找 H.264 编码器名称 */
 static const char* find_h264_encoder_name(void)
 {
-    /* OpenHarmony 支持的 H.264 硬件编码器名称 */
-    return "OH.Media.Codec.Encoder.Video.AVC";
+    /* 先尝试通过 Capability API 动态查询编码器名称 */
+    OH_AVCapability *cap = OH_AVCodec_GetCapability("video/avc", true);
+    if (cap) {
+        const char *name = OH_AVCapability_GetName(cap);
+        if (name && name[0] != '\0') {
+            LOG_TAG_I(ENCODER_TAG, "Found H.264 encoder via capability: %s", name);
+            return name;
+        }
+    }
+
+    /* fallback: 尝试硬件类别查询 */
+    cap = OH_AVCodec_GetCapabilityByCategory("video/avc", true, HARDWARE);
+    if (cap) {
+        const char *name = OH_AVCapability_GetName(cap);
+        if (name && name[0] != '\0') {
+            LOG_TAG_I(ENCODER_TAG, "Found H.264 HW encoder via capability: %s", name);
+            return name;
+        }
+    }
+
+    /* 最后 fallback 到常见名称 */
+    LOG_TAG_W(ENCODER_TAG, "Capability query failed, using fallback encoder name");
+    return "video_encoder.avc";
 }
 
-/* 编码器错误回调 */
-static void on_error(OH_VideoEncoder *codec, int32_t errorCode, void *userData)
+static void on_error(OH_AVCodec *codec, int32_t errorCode, void *userData)
 {
     (void)codec;
     (void)userData;
     LOG_TAG_E(ENCODER_TAG, "Encoder error: %d", errorCode);
 }
 
-/* 编码器输出格式变化回调 - 获取 SPS/PPS */
-static void on_output_format_changed(OH_VideoEncoder *codec, OH_AVFormat *format,
-                                     void *userData)
+static void on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+                              void *userData)
 {
     (void)codec;
     (void)userData;
 
     if (format == NULL) return;
 
-    /* 从输出格式中提取 SPS 和 PPS */
     uint8_t *spsData = NULL;
-    int32_t spsSize = 0;
+    size_t spsSize = 0;
     uint8_t *ppsData = NULL;
-    int32_t ppsSize = 0;
+    size_t ppsSize = 0;
 
-    OH_AVFormat_GetBufferValue(format, "sps", &spsData, &spsSize);
-    OH_AVFormat_GetBufferValue(format, "pps", &ppsData, &ppsSize);
+    OH_AVFormat_GetBuffer(format, "sps", &spsData, &spsSize);
+    OH_AVFormat_GetBuffer(format, "pps", &ppsData, &ppsSize);
 
     if (spsData && spsSize > 0 && ppsData && ppsSize > 0) {
-        /* 保存 SPS/PPS */
         if (g_encoderCtx.spsPps.spsData) free(g_encoderCtx.spsPps.spsData);
         if (g_encoderCtx.spsPps.ppsData) free(g_encoderCtx.spsPps.ppsData);
 
         g_encoderCtx.spsPps.spsData = (uint8_t *)malloc(spsSize);
-        g_encoderCtx.spsPps.spsLength = spsSize;
+        g_encoderCtx.spsPps.spsLength = (uint32_t)spsSize;
         memcpy(g_encoderCtx.spsPps.spsData, spsData, spsSize);
 
         g_encoderCtx.spsPps.ppsData = (uint8_t *)malloc(ppsSize);
-        g_encoderCtx.spsPps.ppsLength = ppsSize;
+        g_encoderCtx.spsPps.ppsLength = (uint32_t)ppsSize;
         memcpy(g_encoderCtx.spsPps.ppsData, ppsData, ppsSize);
 
-        LOG_TAG_I(ENCODER_TAG, "Got SPS(%d) PPS(%d)", spsSize, ppsSize);
+        LOG_TAG_I(ENCODER_TAG, "Got SPS(%zu) PPS(%zu)", spsSize, ppsSize);
 
         if (g_encoderCtx.spsPpsCallback) {
             g_encoderCtx.spsPpsCallback(&g_encoderCtx.spsPps,
@@ -84,36 +108,37 @@ static void on_output_format_changed(OH_VideoEncoder *codec, OH_AVFormat *format
     }
 }
 
-/* 编码器输入缓冲区就绪回调 */
-static void on_input_buffer_available(OH_VideoEncoder *codec, uint32_t index,
-                                      OH_AVMemory *buffer, void *userData)
+static void on_need_input_data(OH_AVCodec *codec, uint32_t index,
+                               OH_AVMemory *data, void *userData)
 {
     (void)codec;
-    (void)index;
-    (void)buffer;
     (void)userData;
-    /* 输入由 video_encoder_encode_frame 主动处理 */
+    g_encoderCtx.inputIndex = index;
+    g_encoderCtx.inputData = data;
+    g_encoderCtx.inputReady = true;
 }
 
-/* 编码器输出缓冲区就绪回调 - 获取编码帧 */
-static void on_output_buffer_available(OH_VideoEncoder *codec, uint32_t index,
-                                       OH_AVMemory *buffer, OH_AVCodecBufferInfo *info,
-                                       OH_AVCodecBufferFlag flag, void *userData)
+static void on_need_output_data(OH_AVCodec *codec, uint32_t index,
+                                OH_AVMemory *data,
+                                OH_AVCodecBufferAttr *attr, void *userData)
 {
     (void)userData;
 
-    if (buffer == NULL || info == NULL) {
+    if (attr == NULL) {
         OH_VideoEncoder_FreeOutputBuffer(codec, index);
         return;
     }
 
-    /* 跳过 codec 配置数据(已通过 format changed 回调获取) */
-    if (flag & AVCODEC_BUFFER_FLAG_CODEC_DATA) {
+    if (attr->flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) {
         OH_VideoEncoder_FreeOutputBuffer(codec, index);
         return;
     }
 
-    uint8_t *outData = OH_AVMemory_GetAddr(buffer);
+    uint8_t *outData = NULL;
+    if (data != NULL) {
+        outData = OH_AVMemory_GetAddr(data);
+    }
+
     if (outData == NULL) {
         OH_VideoEncoder_FreeOutputBuffer(codec, index);
         return;
@@ -121,15 +146,14 @@ static void on_output_buffer_available(OH_VideoEncoder *codec, uint32_t index,
 
     EncodedFrame frame = {0};
     frame.data = outData;
-    frame.length = info->size;
-    frame.timestamp = (uint64_t)info->presentationTimeUs;
-    frame.isKeyFrame = (flag & AVCODEC_BUFFER_FLAG_KEYFRAME) != 0;
+    frame.length = (uint32_t)attr->size;
+    frame.timestamp = (uint64_t)attr->pts;
+    frame.isKeyFrame = (attr->flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0;
 
     if (g_encoderCtx.frameCallback) {
         g_encoderCtx.frameCallback(&frame, g_encoderCtx.frameUserData);
     }
 
-    /* 第一帧必须是关键帧 */
     if (g_encoderCtx.firstFrame && frame.isKeyFrame) {
         g_encoderCtx.firstFrame = false;
     }
@@ -142,7 +166,6 @@ int video_encoder_create(const VideoEncoderConfig *config)
     memset(&g_encoderCtx, 0, sizeof(g_encoderCtx));
     memcpy(&g_encoderCtx.config, config, sizeof(VideoEncoderConfig));
 
-    /* 设置默认值 */
     if (g_encoderCtx.config.bitrate == 0)
         g_encoderCtx.config.bitrate = 4000000;
     if (g_encoderCtx.config.fps == 0)
@@ -150,17 +173,27 @@ int video_encoder_create(const VideoEncoderConfig *config)
     if (g_encoderCtx.config.gopSize == 0)
         g_encoderCtx.config.gopSize = 60;
     if (g_encoderCtx.config.profile == 0)
-        g_encoderCtx.config.profile = 2; /* High */
+        g_encoderCtx.config.profile = 2;
 
-    /* 创建编码器 */
+    /* 优先通过 Capability API 动态获取编码器名称，再创建 */
     const char *codecName = find_h264_encoder_name();
-    g_encoderCtx.encoder = OH_VideoEncoder_CreateByName(codecName);
-    if (g_encoderCtx.encoder == NULL) {
-        LOG_TAG_E(ENCODER_TAG, "Failed to create encoder: %s", codecName);
-        return -1;
+    if (codecName) {
+        g_encoderCtx.encoder = OH_VideoEncoder_CreateByName(codecName);
+        if (g_encoderCtx.encoder != NULL) {
+            LOG_TAG_I(ENCODER_TAG, "Encoder created by name: %s (%ux%u)", codecName,
+                      config->width, config->height);
+            return 0;
+        }
+        LOG_TAG_W(ENCODER_TAG, "CreateByName(%s) failed, trying CreateByMime", codecName);
     }
 
-    LOG_TAG_I(ENCODER_TAG, "Encoder created: %s (%ux%u)", codecName,
+    /* fallback: 使用 mime type 创建 */
+    g_encoderCtx.encoder = OH_VideoEncoder_CreateByMime("video/avc");
+    if (g_encoderCtx.encoder == NULL) {
+        LOG_TAG_E(ENCODER_TAG, "Failed to create encoder by mime video/avc");
+        return -1;
+    }
+    LOG_TAG_I(ENCODER_TAG, "Encoder created by mime video/avc (%ux%u)",
               config->width, config->height);
 
     return 0;
@@ -184,23 +217,19 @@ int video_encoder_start(void)
         return 0;
     }
 
-    /* 配置编码参数 */
     OH_AVFormat *format = OH_AVFormat_Create();
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, g_encoderCtx.config.width);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, g_encoderCtx.config.height);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_RGBA_8888);
-    OH_AVFormat_SetLongValue(format, OH_MD_KEY_BIT_RATE, g_encoderCtx.config.bitrate);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, g_encoderCtx.config.fps);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, g_encoderCtx.config.gopSize);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PROFILE, g_encoderCtx.config.profile);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, (int32_t)g_encoderCtx.config.width);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, (int32_t)g_encoderCtx.config.height);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_RGBA);
+    OH_AVFormat_SetLongValue(format, OH_MD_KEY_BITRATE, (int64_t)g_encoderCtx.config.bitrate);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, (int32_t)g_encoderCtx.config.fps);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, (int32_t)g_encoderCtx.config.gopSize);
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PROFILE, (int32_t)g_encoderCtx.config.profile);
 
-    /* 低延迟优化 */
     if (g_encoderCtx.config.lowLatency) {
         OH_AVFormat_SetIntValue(format, "low_latency", 1);
-        OH_AVFormat_SetIntValue(format, OH_MD_KEY_MAX_B_FRAMES, 0);
     }
 
-    /* 配置编码器 */
     int32_t ret = OH_VideoEncoder_Configure(g_encoderCtx.encoder, format);
     OH_AVFormat_Destroy(format);
 
@@ -209,19 +238,23 @@ int video_encoder_start(void)
         return -1;
     }
 
-    /* 设置异步回调 */
     g_encoderCtx.asyncCallback.onError = on_error;
-    g_encoderCtx.asyncCallback.onOutputFormatChanged = on_output_format_changed;
-    g_encoderCtx.asyncCallback.onInputBufferAvailable = on_input_buffer_available;
-    g_encoderCtx.asyncCallback.onOutputBufferAvailable = on_output_buffer_available;
+    g_encoderCtx.asyncCallback.onStreamChanged = on_stream_changed;
+    g_encoderCtx.asyncCallback.onNeedInputData = on_need_input_data;
+    g_encoderCtx.asyncCallback.onNeedOutputData = on_need_output_data;
 
-    ret = OH_VideoEncoder_SetCallback(g_encoderCtx.encoder, &g_encoderCtx.asyncCallback, NULL);
+    ret = OH_VideoEncoder_SetCallback(g_encoderCtx.encoder, g_encoderCtx.asyncCallback, NULL);
     if (ret != 0) {
         LOG_TAG_E(ENCODER_TAG, "Set callback failed: %d", ret);
         return -1;
     }
 
-    /* 启动编码器 */
+    ret = OH_VideoEncoder_Prepare(g_encoderCtx.encoder);
+    if (ret != 0) {
+        LOG_TAG_E(ENCODER_TAG, "Prepare failed: %d", ret);
+        return -1;
+    }
+
     ret = OH_VideoEncoder_Start(g_encoderCtx.encoder);
     if (ret != 0) {
         LOG_TAG_E(ENCODER_TAG, "Start failed: %d", ret);
@@ -244,21 +277,13 @@ int video_encoder_encode_frame(CapturedFrame *frame)
         return -1;
     }
 
-    /* 获取输入缓冲区 */
-    int32_t inputIndex = OH_VideoEncoder_GetInputBuffer(g_encoderCtx.encoder);
-    if (inputIndex < 0) {
+    if (!g_encoderCtx.inputReady || g_encoderCtx.inputData == NULL) {
         return -1;
     }
 
-    OH_AVMemory *inputBuffer = OH_VideoEncoder_GetInputBufferAt(g_encoderCtx.encoder,
-                                                                  (uint32_t)inputIndex);
-    if (inputBuffer == NULL) {
-        return -1;
-    }
-
-    /* 拷贝帧数据到输入缓冲区 */
-    uint8_t *dst = OH_AVMemory_GetAddr(inputBuffer);
+    uint8_t *dst = OH_AVMemory_GetAddr(g_encoderCtx.inputData);
     if (dst == NULL) {
+        g_encoderCtx.inputReady = false;
         return -1;
     }
 
@@ -272,15 +297,14 @@ int video_encoder_encode_frame(CapturedFrame *frame)
         memcpy(dst + i * dstStride, frame->data + i * srcStride, copyStride);
     }
 
-    /* 提交输入缓冲区 */
-    OH_AVCodecBufferInfo info = {
-        .offset = 0,
-        .size = dstStride * g_encoderCtx.config.height,
-        .presentationTimeUs = (int64_t)frame->timestamp,
-    };
+    OH_AVCodecBufferAttr info;
+    info.pts = (int64_t)frame->timestamp;
+    info.size = (size_t)(dstStride * g_encoderCtx.config.height);
+    info.offset = 0;
+    info.flags = AVCODEC_BUFFER_FLAGS_NONE;
 
-    OH_VideoEncoder_PushInputBuffer(g_encoderCtx.encoder, (uint32_t)inputIndex, &info,
-                                     AVCODEC_BUFFER_FLAG_NONE);
+    OH_VideoEncoder_PushInputData(g_encoderCtx.encoder, g_encoderCtx.inputIndex, info);
+    g_encoderCtx.inputReady = false;
 
     return 0;
 }
@@ -302,7 +326,7 @@ int video_encoder_set_bitrate(uint32_t bitrate)
     if (!g_encoderCtx.running) return -1;
 
     OH_AVFormat *format = OH_AVFormat_Create();
-    OH_AVFormat_SetLongValue(format, OH_MD_KEY_BIT_RATE, bitrate);
+    OH_AVFormat_SetLongValue(format, OH_MD_KEY_BITRATE, (int64_t)bitrate);
     int32_t ret = OH_VideoEncoder_SetParameter(g_encoderCtx.encoder, format);
     OH_AVFormat_Destroy(format);
 

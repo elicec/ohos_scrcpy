@@ -37,7 +37,14 @@ typedef enum {
     MSG_VIDEO_IDR_FRAME  = 0x02,  /* IDR 关键帧 */
     MSG_VIDEO_P_FRAME    = 0x03,  /* P帧 */
     MSG_VIDEO_CONFIG     = 0x04,  /* 视频配置信息 */
+    MSG_VIDEO_RAW_RGBA   = 0x05,  /* Raw RGBA frame */
 } VideoMessageType;
+
+/* 原始帧头部（用于无编码器时直接传输 RGBA 数据） */
+typedef struct __attribute__((packed)) {
+    uint16_t width;
+    uint16_t height;
+} RawFrameHeader;
 
 /* 视频帧头部 */
 typedef struct __attribute__((packed)) {

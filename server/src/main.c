@@ -22,6 +22,9 @@
 /* 全局运行标志 */
 static volatile bool g_running = true;
 
+/* 编码器是否可用 */
+static bool g_encoderAvailable = false;
+
 /* 服务端配置 */
 typedef struct {
     uint16_t videoPort;
@@ -123,11 +126,57 @@ static void on_encoded_frame(EncodedFrame *frame, void *userData)
     tcp_server_send_video_frame(type, frame->data, frame->length, frame->timestamp);
 }
 
-/* 屏幕帧回调 - 送入编码器 */
+/* 屏幕帧回调 - 送入编码器或直接发送原始 RGBA */
 static void on_screen_frame(CapturedFrame *frame, void *userData)
 {
     (void)userData;
-    video_encoder_encode_frame(frame);
+
+    static int frameCount = 0;
+    frameCount++;
+
+    if (g_encoderAvailable) {
+        video_encoder_encode_frame(frame);
+    } else {
+        /* 无编码器可用，直接发送原始 RGBA 帧 */
+        if (frameCount <= 3 || frameCount % 60 == 0) {
+            LOG_TAG_I(MAIN_TAG, "Sending raw RGBA frame #%d: %ux%u stride=%u data=%p",
+                      frameCount, frame->width, frame->height, frame->stride, frame->data);
+        }
+        RawFrameHeader rawHeader;
+        rawHeader.width = (uint16_t)frame->width;
+        rawHeader.height = (uint16_t)frame->height;
+
+        /* 计算实际像素数据长度（考虑 stride） */
+        uint32_t pixelDataLen = frame->stride * frame->height;
+        uint32_t totalLen = sizeof(RawFrameHeader) + pixelDataLen;
+
+        uint8_t *sendBuf = (uint8_t *)malloc(totalLen);
+        if (sendBuf == NULL) {
+            LOG_TAG_E(MAIN_TAG, "Failed to allocate raw frame buffer");
+            return;
+        }
+
+        memcpy(sendBuf, &rawHeader, sizeof(RawFrameHeader));
+
+        /* 逐行拷贝像素数据，处理 stride 与 width*4 不一致的情况 */
+        uint32_t rowBytes = frame->width * 4;
+        if (frame->stride == rowBytes) {
+            memcpy(sendBuf + sizeof(RawFrameHeader), frame->data, pixelDataLen);
+        } else {
+            uint8_t *dst = sendBuf + sizeof(RawFrameHeader);
+            const uint8_t *src = frame->data;
+            for (uint32_t y = 0; y < frame->height; y++) {
+                memcpy(dst, src, rowBytes);
+                dst += rowBytes;
+                src += frame->stride;
+            }
+            /* 实际发送长度调整为紧凑数据 */
+            totalLen = sizeof(RawFrameHeader) + rowBytes * frame->height;
+        }
+
+        tcp_server_send_video_frame(MSG_VIDEO_RAW_RGBA, sendBuf, totalLen, frame->timestamp);
+        free(sendBuf);
+    }
 }
 
 /* 解析命令行参数 */
@@ -210,10 +259,30 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* 3. 创建视频编码器 */
+    /* 3. 创建 TCP 服务端（先启动 TCP 等待客户端连接） */
+    ServerConfig serverConfig = {
+        .videoPort = g_appConfig.videoPort,
+        .controlPort = g_appConfig.controlPort,
+    };
+
+    if (tcp_server_create(&serverConfig) != 0) {
+        LOG_TAG_E(MAIN_TAG, "TCP server create failed");
+        return 1;
+    }
+
+    /* 设置控制消息回调 */
+    tcp_server_set_control_callback(on_control_message, NULL);
+
+    /* 4. 启动 TCP 服务(等待客户端连接) - 阻塞直到客户端连接 */
+    if (tcp_server_start() != 0) {
+        LOG_TAG_E(MAIN_TAG, "TCP server start failed");
+        return 1;
+    }
+
+    /* 5. 客户端已连接，现在创建视频编码器 */
     VideoEncoderConfig encoderConfig = {
-        .width = captureConfig.width > 0 ? captureConfig.width : 0,
-        .height = captureConfig.height > 0 ? captureConfig.height : 0,
+        .width = 0,
+        .height = 0,
         .bitrate = g_appConfig.bitrate,
         .fps = g_appConfig.fps,
         .gopSize = g_appConfig.fps,
@@ -228,38 +297,20 @@ int main(int argc, char *argv[])
     encoderConfig.height = (uint32_t)(actualH * g_appConfig.scale) & ~1;
 
     if (video_encoder_create(&encoderConfig) != 0) {
-        LOG_TAG_E(MAIN_TAG, "Video encoder create failed");
-        return 1;
-    }
+        LOG_TAG_W(MAIN_TAG, "Video encoder create failed, falling back to raw RGBA mode");
+        g_encoderAvailable = false;
+    } else {
+        /* 6. 设置编码器回调 */
+        video_encoder_set_frame_callback(on_encoded_frame, NULL);
+        video_encoder_set_sps_pps_callback(on_sps_pps, NULL);
 
-    /* 4. 创建 TCP 服务端 */
-    ServerConfig serverConfig = {
-        .videoPort = g_appConfig.videoPort,
-        .controlPort = g_appConfig.controlPort,
-    };
-
-    if (tcp_server_create(&serverConfig) != 0) {
-        LOG_TAG_E(MAIN_TAG, "TCP server create failed");
-        return 1;
-    }
-
-    /* 设置控制消息回调 */
-    tcp_server_set_control_callback(on_control_message, NULL);
-
-    /* 5. 启动 TCP 服务(等待客户端连接) */
-    if (tcp_server_start() != 0) {
-        LOG_TAG_E(MAIN_TAG, "TCP server start failed");
-        return 1;
-    }
-
-    /* 6. 设置编码器回调 */
-    video_encoder_set_frame_callback(on_encoded_frame, NULL);
-    video_encoder_set_sps_pps_callback(on_sps_pps, NULL);
-
-    /* 7. 启动编码器 */
-    if (video_encoder_start() != 0) {
-        LOG_TAG_E(MAIN_TAG, "Video encoder start failed");
-        return 1;
+        /* 7. 启动编码器 */
+        if (video_encoder_start() != 0) {
+            LOG_TAG_W(MAIN_TAG, "Video encoder start failed, falling back to raw RGBA mode");
+            g_encoderAvailable = false;
+        } else {
+            g_encoderAvailable = true;
+        }
     }
 
     /* 8. 发送视频配置信息 */
@@ -274,8 +325,7 @@ int main(int argc, char *argv[])
 
     /* 9. 启动屏幕捕获 */
     if (screen_capture_start(on_screen_frame, NULL) != 0) {
-        LOG_TAG_E(MAIN_TAG, "Screen capture start failed");
-        return 1;
+        LOG_TAG_W(MAIN_TAG, "Screen capture start failed, running without capture");
     }
 
     LOG_TAG_I(MAIN_TAG, "Server running... (Ctrl+C to stop)");

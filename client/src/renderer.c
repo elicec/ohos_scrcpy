@@ -44,18 +44,31 @@ static const char *FRAGMENT_SHADER =
     "    FragColor = vec4(r, g, b, 1.0);\n"
     "}\n";
 
+/* OpenGL RGBA 渲染着色器 */
+static const char *RGBA_FRAGMENT_SHADER =
+    "#version 330 core\n"
+    "in vec2 TexCoord;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D texRGBA;\n"
+    "void main() {\n"
+    "    FragColor = texture(texRGBA, TexCoord);\n"
+    "}\n";
+
 typedef struct {
     SDL_Window   *window;
     SDL_GLContext  glContext;
     GLuint        program;
+    GLuint        rgbaProgram;
     GLuint        vao, vbo;
     GLuint        texY, texU, texV;
+    GLuint        texRGBA;
     int           videoWidth;
     int           videoHeight;
     int           windowWidth;
     int           windowHeight;
     bool          fullscreen;
     bool          shouldClose;
+    bool          rgbaMode;
     RenderStats   stats;
     uint32_t      lastFpsTime;
     uint32_t      fpsFrameCount;
@@ -239,6 +252,23 @@ int renderer_create(const RendererConfig *config)
     /* 创建 YUV 纹理 */
     create_yuv_textures();
 
+    /* 创建 RGBA 着色器程序 */
+    g_renderCtx.rgbaProgram = create_program(VERTEX_SHADER, RGBA_FRAGMENT_SHADER);
+    if (!g_renderCtx.rgbaProgram) {
+        LOG_TAG_E(RENDER_TAG, "RGBA shader program create failed");
+        return -1;
+    }
+
+    /* 创建 RGBA 纹理 */
+    glGenTextures(1, &g_renderCtx.texRGBA);
+    glBindTexture(GL_TEXTURE_2D, g_renderCtx.texRGBA);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    g_renderCtx.rgbaMode = false;
+
     /* 获取窗口尺寸 */
     SDL_GetWindowSize(g_renderCtx.window,
                       &g_renderCtx.windowWidth, &g_renderCtx.windowHeight);
@@ -319,33 +349,88 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
     return 0;
 }
 
-bool renderer_poll_events(void)
+int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height)
 {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-            case SDL_QUIT:
-                g_renderCtx.shouldClose = true;
-                return false;
-            case SDL_WINDOWEVENT:
-                if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    g_renderCtx.windowWidth = event.window.data1;
-                    g_renderCtx.windowHeight = event.window.data2;
-                    SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
-                    update_viewport();
-                }
-                break;
-            case SDL_KEYDOWN:
-                if (event.key.keysym.sym == SDLK_F11) {
-                    renderer_toggle_fullscreen();
-                } else if (event.key.keysym.sym == SDLK_ESCAPE &&
-                           g_renderCtx.fullscreen) {
-                    renderer_toggle_fullscreen();
-                }
-                break;
+    SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+
+    /* 首次收到 RGBA 帧时切换到 RGBA 模式 */
+    if (!g_renderCtx.rgbaMode) {
+        g_renderCtx.rgbaMode = true;
+        renderer_update_video_size(width, height);
+        LOG_TAG_I(RENDER_TAG, "Switched to RGBA mode (%dx%d)", width, height);
+    }
+
+    /* 更新 RGBA 纹理 */
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_renderCtx.texRGBA);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgbaData);
+
+    GLenum glErr = glGetError();
+    if (glErr != GL_NO_ERROR) {
+        static int errCount = 0;
+        if (errCount < 3) {
+            errCount++;
+            LOG_TAG_E(RENDER_TAG, "glTexImage2D error: 0x%x", glErr);
         }
     }
-    return true;
+
+    /* 渲染 */
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(g_renderCtx.rgbaProgram);
+    glUniform1i(glGetUniformLocation(g_renderCtx.rgbaProgram, "texRGBA"), 0);
+
+    glBindVertexArray(g_renderCtx.vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    SDL_GL_SwapWindow(g_renderCtx.window);
+
+    /* 更新 FPS 统计 */
+    g_renderCtx.stats.frameCount++;
+    g_renderCtx.fpsFrameCount++;
+    uint32_t now = SDL_GetTicks();
+    if (now - g_renderCtx.lastFpsTime >= 1000) {
+        g_renderCtx.stats.fps = g_renderCtx.fpsFrameCount;
+        g_renderCtx.fpsFrameCount = 0;
+        g_renderCtx.lastFpsTime = now;
+        LOG_TAG_I(RENDER_TAG, "RGBA render FPS: %u", g_renderCtx.stats.fps);
+    }
+
+    return 0;
+}
+
+bool renderer_poll_events(void)
+{
+    return !g_renderCtx.shouldClose;
+}
+
+void renderer_handle_event(const SDL_Event *event)
+{
+    if (!event) return;
+
+    switch (event->type) {
+        case SDL_WINDOWEVENT:
+            if (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                g_renderCtx.windowWidth = event->window.data1;
+                g_renderCtx.windowHeight = event->window.data2;
+                SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+                update_viewport();
+            }
+            break;
+        case SDL_KEYDOWN:
+            if (event->key.keysym.sym == SDLK_F11) {
+                renderer_toggle_fullscreen();
+            } else if (event->key.keysym.sym == SDLK_ESCAPE &&
+                       g_renderCtx.fullscreen) {
+                renderer_toggle_fullscreen();
+            }
+            break;
+        case SDL_QUIT:
+            g_renderCtx.shouldClose = true;
+            break;
+    }
 }
 
 void renderer_toggle_fullscreen(void)
@@ -364,6 +449,11 @@ void renderer_get_window_size(int *width, int *height)
 {
     *width = g_renderCtx.windowWidth;
     *height = g_renderCtx.windowHeight;
+}
+
+SDL_Window *renderer_get_window(void)
+{
+    return g_renderCtx.window;
 }
 
 void renderer_get_stats(RenderStats *stats)
@@ -385,7 +475,9 @@ void renderer_destroy(void)
     if (g_renderCtx.texY) glDeleteTextures(1, &g_renderCtx.texY);
     if (g_renderCtx.texU) glDeleteTextures(1, &g_renderCtx.texU);
     if (g_renderCtx.texV) glDeleteTextures(1, &g_renderCtx.texV);
+    if (g_renderCtx.texRGBA) glDeleteTextures(1, &g_renderCtx.texRGBA);
     if (g_renderCtx.program) glDeleteProgram(g_renderCtx.program);
+    if (g_renderCtx.rgbaProgram) glDeleteProgram(g_renderCtx.rgbaProgram);
 
     if (g_renderCtx.glContext) {
         SDL_GL_DeleteContext(g_renderCtx.glContext);
