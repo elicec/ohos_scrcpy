@@ -113,17 +113,16 @@ static void on_video_buffer_available(OH_AVScreenCapture *capture, bool isReady)
         return;
     }
 
-    /* 优先使用 MapPlanes 返回的真实 rowStride（字节数），它比 bufConfig.stride 更可靠。
-     * 若无法获取 MapPlanes，回退到紧凑 stride (width * 4)。
-     * 实测发现 OH_AVScreenCapture 返回的 bufConfig.stride 可能大于实际像素行字节数
-     * （例如紧凑数据仍报告 stride=2176），用其逐行拷贝反而会把下一行数据错当成
-     * 当前行 padding，导致画面倾斜。紧凑提取在 padding 为重复像素或零时也是安全的。 */
-    uint32_t widthBytes = frame.width * 4;
-    uint32_t actualStride = widthBytes; /* 默认紧凑 */
-    if (usedMapPlanes && planes.planeCount > 0 && planes.planes[0].rowStride > 0) {
-        actualStride = planes.planes[0].rowStride;
-    }
-    frame.stride = actualStride;
+    /* OH_AVScreenCapture 输出的 RGBA 数据为“紧凑排布”：每行恰好 width*4 字节，
+     * 有效像素紧挨着连续存放。
+     *
+     * 注意：bufConfig.stride / MapPlanes.rowStride 返回的可能是“内存分配对齐宽度”，
+     * 例如 1080x2408 缩放为 540x1204 时，bufConfig.stride 报 2176（=544px*4），
+     * 但真实数据行跨度只有 2160（=540px*4）。若按 2176 跨行读取，每行会错位 16 字节
+     * 并随行号累积，导致画面逐行漂移、整体倾斜（实测正确画面需按紧凑 2160 读取）。
+     *
+     * 因此这里统一使用紧凑 width*4 作为行跨度，忽略对齐值。 */
+    frame.stride = frame.width * 4;
     frame.data = (uint8_t *)virAddr;
 
     g_captureCtx.callback(&frame, g_captureCtx.userData);

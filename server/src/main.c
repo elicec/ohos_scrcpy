@@ -143,8 +143,9 @@ static void on_screen_frame(CapturedFrame *frame, void *userData)
         rawHeader.height = (uint16_t)frame->height;
         rawHeader.bufWidth = frame->width;
 
-        /* NativeBuffer 的实际 stride 可能包含对齐 padding（如 540 宽时 stride=544），
-         * 直接发送会导致客户端渲染倾斜。此处去除 padding，发送紧凑 RGBA 数据。 */
+        /* OH_AVScreenCapture 输出的 RGBA 数据为紧凑排布，frame->stride 已等于
+         * width*4（见 screen_capture.c）。这里按 stride 逐行提取，当 stride 与
+         * 紧凑值相等时直接整块拷贝，保证发送给客户端的是紧凑 RGBA 数据。 */
         uint32_t compactRowBytes = frame->width * 4;
         uint32_t srcRowBytes = frame->stride > 0 ? frame->stride : compactRowBytes;
         uint32_t pixelDataLen = compactRowBytes * frame->height;
