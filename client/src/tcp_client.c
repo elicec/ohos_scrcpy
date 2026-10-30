@@ -44,7 +44,8 @@ typedef int socket_t;
 #endif
 
 #define NET_TAG "Client"
-#define RECV_BUF_SIZE (4 * 1024 * 1024)  /* 4MB, 足够容纳一帧原始 RGBA 数据 */
+#define RECV_BUF_SIZE (4 * 1024 * 1024)  /* 4MB，接收缓冲初始大小（按帧长按需增长） */
+#define MAX_VIDEO_FRAME_SIZE (64 * 1024 * 1024)  /* 单帧上限 64MB，防止异常长度撑爆内存 */
 
 typedef struct {
     socket_t videoFd;
@@ -133,7 +134,11 @@ static socket_t connect_to_server(const char *host, uint16_t port)
 static void *video_thread_func(void *param)
 {
     (void)param;
-    uint8_t *recvBuf = (uint8_t *)malloc(RECV_BUF_SIZE);
+    /* 接收缓冲按帧长按需增长：scale=1.0 时一帧原始 RGBA 可达 10MB 以上
+     * （如 1080x2408x4 ≈ 10.4MB），固定 4MB 缓冲会导致超限帧既无法接收
+     * 也未从 socket 丢弃，残留数据使后续 header 解析错位，画面永久黑屏。 */
+    size_t bufCap = RECV_BUF_SIZE;
+    uint8_t *recvBuf = (uint8_t *)malloc(bufCap);
     if (!recvBuf) return NULL;
 
     while (g_clientCtx.videoThreadRunning) {
@@ -143,18 +148,48 @@ static void *video_thread_func(void *param)
             break;
         }
 
-        if (header.length > 0 && header.length < RECV_BUF_SIZE) {
-            if (recv_all(g_clientCtx.videoFd, recvBuf, header.length) != 0) {
+        if (header.length == 0) {
+            continue;
+        }
+
+        if (header.length > MAX_VIDEO_FRAME_SIZE) {
+            /* 超过合理上限：读丢 payload 以保持字节流对齐，避免流错位 */
+            LOG_TAG_W(NET_TAG, "Frame too large (%u bytes), dropped", header.length);
+            uint8_t sink[65536];
+            uint32_t remaining = header.length;
+            while (remaining > 0 &&
+                   recv_all(g_clientCtx.videoFd, sink,
+                            remaining < sizeof(sink) ? remaining : sizeof(sink)) == 0) {
+                uint32_t got = remaining < sizeof(sink) ? remaining : (uint32_t)sizeof(sink);
+                remaining -= got;
+            }
+            if (remaining > 0) {
                 LOG_TAG_W(NET_TAG, "Video data recv failed");
                 break;
             }
+            continue;
+        }
 
-            if (g_clientCtx.videoCallback) {
-                g_clientCtx.videoCallback((VideoMessageType)header.type,
-                                          recvBuf, header.length,
-                                          header.timestamp,
-                                          g_clientCtx.videoUserData);
+        if ((size_t)header.length > bufCap) {
+            uint8_t *grown = (uint8_t *)realloc(recvBuf, header.length);
+            if (!grown) {
+                LOG_TAG_E(NET_TAG, "Failed to grow recv buffer to %u bytes", header.length);
+                break;
             }
+            recvBuf = grown;
+            bufCap = header.length;
+        }
+
+        if (recv_all(g_clientCtx.videoFd, recvBuf, header.length) != 0) {
+            LOG_TAG_W(NET_TAG, "Video data recv failed");
+            break;
+        }
+
+        if (g_clientCtx.videoCallback) {
+            g_clientCtx.videoCallback((VideoMessageType)header.type,
+                                      recvBuf, header.length,
+                                      header.timestamp,
+                                      g_clientCtx.videoUserData);
         }
     }
 

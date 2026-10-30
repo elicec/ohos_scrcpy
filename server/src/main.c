@@ -41,7 +41,7 @@ typedef struct {
 static ServerAppConfig g_appConfig = {
     .videoPort   = DEFAULT_VIDEO_PORT,
     .controlPort = DEFAULT_CONTROL_PORT,
-    .scale       = 0.5f,
+    .scale       = 1.0f,
     .bitrate     = 4000000,
     .fps         = 60,
     .lowLatency  = true,
@@ -129,6 +129,13 @@ static void on_encoded_frame(EncodedFrame *frame, void *userData)
     tcp_server_send_video_frame(type, frame->data, frame->length, frame->timestamp);
 }
 
+/* 原始 RGBA 模式的发送帧率上限。
+ * scale=1.0 时一帧原始 RGBA 约 10MB（如 1080x2408x4），60fps 需要 ~624MB/s，
+ * 远超 hdc 端口转发的实际吞吐，发送堆积会导致转发通道被重置（黑屏/断连）。
+ * 限制到 15fps 后带宽需求降到 ~156MB/s，与 scale=0.5@60fps 相当，可稳定传输。 */
+#define RAW_MODE_MAX_FPS 15
+#define RAW_MODE_MIN_INTERVAL_US (1000000 / RAW_MODE_MAX_FPS)
+
 /* 屏幕帧回调 - 送入编码器或直接发送原始 RGBA */
 static void on_screen_frame(CapturedFrame *frame, void *userData)
 {
@@ -137,7 +144,13 @@ static void on_screen_frame(CapturedFrame *frame, void *userData)
     if (g_encoderAvailable) {
         video_encoder_encode_frame(frame);
     } else {
-        /* 无编码器可用，直接发送原始 RGBA 帧 */
+        /* 无编码器可用，直接发送原始 RGBA 帧（限帧发送） */
+        static uint64_t lastSentTs = 0;
+        if (lastSentTs != 0 &&
+            frame->timestamp - lastSentTs < RAW_MODE_MIN_INTERVAL_US) {
+            return; /* 距上一帧发送间隔不足，丢弃该帧 */
+        }
+
         RawFrameHeader rawHeader;
         rawHeader.width = (uint16_t)frame->width;
         rawHeader.height = (uint16_t)frame->height;
@@ -172,6 +185,7 @@ static void on_screen_frame(CapturedFrame *frame, void *userData)
         }
 
         tcp_server_send_video_frame(MSG_VIDEO_RAW_RGBA, sendBuf, totalLen, frame->timestamp);
+        lastSentTs = frame->timestamp;
 
         free(sendBuf);
     }

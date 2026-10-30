@@ -40,7 +40,7 @@ typedef struct {
 
 static AppConfig g_appConfig = {
     .serial     = "",
-    .scale      = 0.5f,
+    .scale      = 1.0f,
     .bitrate    = 4000000,
     .fps        = 60,
     .fullscreen = false,
@@ -63,6 +63,16 @@ static int g_rgbaHeight = 0;
 static uint32_t g_rgbaStride = 0;
 static volatile bool g_rgbaFrameReady = false;
 static pthread_mutex_t g_rgbaMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* H264 解码 YUV 帧缓冲区（线程安全：视频接收线程写入，主线程读取渲染）
+ * Windows 上 GL 上下文同一时刻只能属于一个线程，必须在主线程渲染 */
+static uint8_t *g_yuvPlanes[3] = {NULL, NULL, NULL};
+static size_t   g_yuvPlaneSize[3] = {0, 0, 0};
+static int      g_yuvStrides[3] = {0, 0, 0};
+static int      g_yuvWidth = 0;
+static int      g_yuvHeight = 0;
+static volatile bool g_yuvFrameReady = false;
+static pthread_mutex_t g_yuvMutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* 待处理的视频配置（视频接收线程写入，主线程读取并应用）
  * 避免在视频线程调用 renderer_update_video_size / SDL_SetWindowSize，
@@ -106,7 +116,7 @@ static void parse_args(int argc, char *argv[])
                    "Usage: ohos_scrcpy [options]\n\n"
                    "Options:\n"
                    "  -s SERIAL           Device serial number\n"
-                   "  --scale SCALE       Screen scale (default: 0.5)\n"
+                   "  --scale SCALE       Screen scale (default: 1.0)\n"
                    "  --bitrate BPS       Video bitrate (default: 4000000)\n"
                    "  --fps FPS           Target FPS (default: 60)\n"
                    "  -f, --fullscreen    Start in fullscreen\n"
@@ -230,15 +240,37 @@ static void on_video_frame(VideoMessageType type,
     }
 }
 
-/* 解码帧回调 */
+/* 解码帧回调（视频接收线程调用）：
+ * 复制解码帧到共享缓冲，由主线程渲染。
+ * Windows 上 GL 上下文同一时刻只能属于一个线程，
+ * 在视频线程直接渲染会导致 SDL_GL_MakeCurrent 失败。 */
 static void on_decoded_frame(DecodedFrame *frame, void *userData)
 {
     (void)userData;
-    renderer_render_frame(
-        frame->data[0], frame->linesize[0],
-        frame->data[1], frame->linesize[1],
-        frame->data[2], frame->linesize[2],
-        frame->width, frame->height);
+
+    pthread_mutex_lock(&g_yuvMutex);
+    for (int i = 0; i < 3; i++) {
+        int stride = frame->linesize[i];
+        int rows = (i == 0) ? frame->height : (frame->height + 1) / 2;
+        size_t need = (stride > 0 && rows > 0) ? (size_t)stride * rows : 0;
+
+        if (need == 0 || frame->data[i] == NULL) {
+            continue;
+        }
+        if (g_yuvPlanes[i] == NULL || g_yuvPlaneSize[i] != need) {
+            free(g_yuvPlanes[i]);
+            g_yuvPlanes[i] = (uint8_t *)malloc(need);
+            g_yuvPlaneSize[i] = need;
+        }
+        if (g_yuvPlanes[i]) {
+            memcpy(g_yuvPlanes[i], frame->data[i], need);
+            g_yuvStrides[i] = stride;
+        }
+    }
+    g_yuvWidth = frame->width;
+    g_yuvHeight = frame->height;
+    g_yuvFrameReady = true;
+    pthread_mutex_unlock(&g_yuvMutex);
 }
 
 /* 控制消息回调 */
@@ -531,6 +563,18 @@ int main(int argc, char *argv[])
                 g_rgbaFrameReady = false;
             }
             pthread_mutex_unlock(&g_rgbaMutex);
+        } else {
+            /* 在主线程中渲染 H264 解码的 YUV 帧（GL 上下文安全） */
+            pthread_mutex_lock(&g_yuvMutex);
+            if (g_yuvFrameReady && g_yuvPlanes[0]) {
+                renderer_render_frame(
+                    g_yuvPlanes[0], g_yuvStrides[0],
+                    g_yuvPlanes[1], g_yuvStrides[1],
+                    g_yuvPlanes[2], g_yuvStrides[2],
+                    g_yuvWidth, g_yuvHeight);
+                g_yuvFrameReady = false;
+            }
+            pthread_mutex_unlock(&g_yuvMutex);
         }
 
         input_handler_update_window_size(winW, winH);
@@ -554,6 +598,12 @@ cleanup:
 
     free(g_rgbaBuffer);
     g_rgbaBuffer = NULL;
+
+    for (int i = 0; i < 3; i++) {
+        free(g_yuvPlanes[i]);
+        g_yuvPlanes[i] = NULL;
+        g_yuvPlaneSize[i] = 0;
+    }
 
     hdc_manager_stop_server(serial);
     hdc_manager_remove_forward(serial, g_appConfig.videoPort);

@@ -313,26 +313,33 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
                           const uint8_t *vData, int vStride,
                           int width, int height)
 {
-    SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
+    if (SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext) != 0) {
+        LOG_TAG_E(RENDER_TAG, "MakeCurrent failed: %s", SDL_GetError());
+        return -1;
+    }
     update_viewport();
 
-    /* 更新 Y 纹理 */
+    /* 更新 Y 纹理（stride 可能大于 width，用 UNPACK_ROW_LENGTH 跳过对齐填充） */
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_renderCtx.texY);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, yStride);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0,
                  GL_RED, GL_UNSIGNED_BYTE, yData);
 
     /* 更新 U 纹理 */
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g_renderCtx.texU);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, uStride);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width / 2, height / 2, 0,
                  GL_RED, GL_UNSIGNED_BYTE, uData);
 
     /* 更新 V 纹理 */
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, g_renderCtx.texV);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, vStride);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width / 2, height / 2, 0,
                  GL_RED, GL_UNSIGNED_BYTE, vData);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
     /* 渲染 */
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
