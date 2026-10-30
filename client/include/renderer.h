@@ -58,6 +58,10 @@ bool renderer_poll_events(void);
 /* 处理单个 SDL 事件（窗口事件、F11/ESC 等） */
 void renderer_handle_event(const SDL_Event *event);
 
+/* 取出并清除重绘请求：窗口尺寸变化后返回 true，
+ * 主循环应立即用最后一帧重绘（damage 采集静止时新帧间隔可达数秒） */
+bool renderer_take_redraw_request(void);
+
 /* 切换全屏 */
 void renderer_toggle_fullscreen(void);
 

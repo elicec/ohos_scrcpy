@@ -71,6 +71,7 @@ typedef struct {
     int           toolbarWidth;
     bool          fullscreen;
     bool          shouldClose;
+    bool          needsRedraw;  /* 窗口尺寸变化后需要立即重绘最后一帧 */
     bool          rgbaMode;
     RenderStats   stats;
     uint32_t      lastFpsTime;
@@ -145,6 +146,11 @@ static void create_yuv_textures(void)
 /* 更新视口保持宽高比，留出右侧工具栏空间 */
 static void update_viewport(void)
 {
+    /* 回读真实窗口尺寸：最大化/还原时 SDL_SetWindowSize 可能被系统忽略，
+     * 事件缓存可能与实际失联，渲染视口必须以真实尺寸为准 */
+    SDL_GetWindowSize(g_renderCtx.window,
+                      &g_renderCtx.windowWidth, &g_renderCtx.windowHeight);
+
     int winW = g_renderCtx.windowWidth - g_renderCtx.toolbarWidth;
     int winH = g_renderCtx.windowHeight;
     int vidW = g_renderCtx.videoWidth;
@@ -300,7 +306,9 @@ int renderer_update_video_size(int width, int height)
         int winW = (int)(winH * aspect) + g_renderCtx.toolbarWidth;
 
         SDL_SetWindowSize(g_renderCtx.window, winW, winH);
-        g_renderCtx.windowWidth = winW;
+        /* SetWindowSize 在窗口被系统最大化时会被忽略，回读真实值同步缓存 */
+        SDL_GetWindowSize(g_renderCtx.window,
+                          &g_renderCtx.windowWidth, &g_renderCtx.windowHeight);
     }
 
     update_viewport();
@@ -353,6 +361,10 @@ int renderer_render_frame(const uint8_t *yData, int yStride,
     glBindVertexArray(g_renderCtx.vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+    /* 工具栏缓存尺寸与真实窗口同步（最大化/还原后立即生效） */
+    int tbW, tbH;
+    SDL_GetWindowSize(g_renderCtx.window, &tbW, &tbH);
+    toolbar_resize(tbW, tbH);
     toolbar_render();
     SDL_GL_SwapWindow(g_renderCtx.window);
 
@@ -399,6 +411,10 @@ int renderer_render_rgba_frame(const uint8_t *rgbaData, int width, int height, u
     glBindVertexArray(g_renderCtx.vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+    /* 工具栏缓存尺寸与真实窗口同步（最大化/还原后立即生效） */
+    int tbW, tbH;
+    SDL_GetWindowSize(g_renderCtx.window, &tbW, &tbH);
+    toolbar_resize(tbW, tbH);
     toolbar_render();
     SDL_GL_SwapWindow(g_renderCtx.window);
 
@@ -423,14 +439,14 @@ bool renderer_poll_events(void)
 void renderer_handle_event(const SDL_Event *event)
 {
     if (!event) return;
-
     switch (event->type) {
         case SDL_WINDOWEVENT:
             if (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                g_renderCtx.windowWidth = event->window.data1;
-                g_renderCtx.windowHeight = event->window.data2;
+                /* 真实尺寸由 update_viewport 回读；此处标记立即重绘——
+                 * damage 采集静止时数秒不来新帧，不重绘会残留旧画面 */
                 SDL_GL_MakeCurrent(g_renderCtx.window, g_renderCtx.glContext);
                 update_viewport();
+                g_renderCtx.needsRedraw = true;
             }
             break;
         case SDL_KEYDOWN:
@@ -445,6 +461,14 @@ void renderer_handle_event(const SDL_Event *event)
             g_renderCtx.shouldClose = true;
             break;
     }
+}
+
+/* 取出并清除重绘请求（窗口尺寸变化后主循环应立即用最后一帧重绘） */
+bool renderer_take_redraw_request(void)
+{
+    bool r = g_renderCtx.needsRedraw;
+    g_renderCtx.needsRedraw = false;
+    return r;
 }
 
 void renderer_toggle_fullscreen(void)

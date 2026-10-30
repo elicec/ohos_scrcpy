@@ -473,8 +473,9 @@ int main(int argc, char *argv[])
 
     /* 12. 主循环 */
     while (g_running && !renderer_should_close()) {
+        /* 回读真实窗口尺寸（最大化/还原后立即生效，供输入映射与工具栏热区使用） */
         int winW, winH;
-        renderer_get_window_size(&winW, &winH);
+        SDL_GetWindowSize(renderer_get_window(), &winW, &winH);
 
         /* 处理所有 SDL 事件（窗口、输入等） */
         SDL_Event event;
@@ -556,9 +557,11 @@ int main(int argc, char *argv[])
         }
 
         /* 在主线程中渲染 RGBA 帧（GL 上下文安全） */
+        /* 窗口尺寸变化后用最后一帧立即重绘（damage 采集静止时残留旧画面数秒） */
+        bool redraw = renderer_take_redraw_request();
         if (g_rawRgbaMode) {
             pthread_mutex_lock(&g_rgbaMutex);
-            if (g_rgbaFrameReady && g_rgbaBuffer) {
+            if ((g_rgbaFrameReady || redraw) && g_rgbaBuffer) {
                 renderer_render_rgba_frame(g_rgbaBuffer, g_rgbaWidth, g_rgbaHeight, g_rgbaStride);
                 g_rgbaFrameReady = false;
             }
@@ -566,7 +569,7 @@ int main(int argc, char *argv[])
         } else {
             /* 在主线程中渲染 H264 解码的 YUV 帧（GL 上下文安全） */
             pthread_mutex_lock(&g_yuvMutex);
-            if (g_yuvFrameReady && g_yuvPlanes[0]) {
+            if ((g_yuvFrameReady || redraw) && g_yuvPlanes[0]) {
                 renderer_render_frame(
                     g_yuvPlanes[0], g_yuvStrides[0],
                     g_yuvPlanes[1], g_yuvStrides[1],
