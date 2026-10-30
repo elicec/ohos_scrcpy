@@ -30,7 +30,7 @@
 |------|------|
 | 实时屏幕镜像 | 通过 USB 投屏 OpenHarmony 设备画面到 PC |
 | 双通道通信 | 视频通道 + 控制通道分离，降低延迟 |
-| H.264 硬件编解码 | 设备端硬件编码，PC 端硬件/软件解码 |
+| H.264 编码传输 | 服务端编码后传输：优先 OH_AVCodec 硬编，自动回退 OpenH264 软编（`sw_encoder.cpp`）；PC 端 FFmpeg 解码 |
 | RGBA 降级模式 | 当编码器不可用时，直接传输原始 RGBA 帧 |
 | 输入回传 | 鼠标、键盘、滚轮、系统快捷键注入设备 |
 | 跨平台客户端 | 支持 Windows / Linux / macOS |
@@ -97,6 +97,62 @@ PC 端通过 `hdc` 工具与设备建立 USB 通信，使用 `hdc fport` 进行�
 
 控制通道同时承载握手协议，连接建立后用于传输输入事件和心跳。
 
+### 2.3 视频数据传输方案（当前实现）
+
+视频链路为 **服务端编码后传输**（H.264 + TCP），仅在编码器完全不可用时才降级为原始 RGBA 直传：
+
+```
+设备端 (server)                                PC 端 (client)
+┌──────────────────────────┐                  ┌──────────────────────────┐
+│ 屏幕采集 (damage 驱动)    │                  │ TCP 接收 (9901)          │
+│   RGBA 1080x2408         │                  │   ↓                      │
+│   ↓                      │    hdc fport     │ FFmpeg 软解 H.264        │
+│ RGBA → I420 (BT.601)     │  ───────────►    │   ↓ (YUV420P)            │
+│   ↓                      │   127.0.0.1:9901 │   ↓                      │
+│ H.264 编码               │                  │ 主线程 GL 渲染           │
+│  优先硬编 → 回退软编      │                  │   (YUV shader)           │
+└──────────────────────────┘                  └──────────────────────────┘
+```
+
+#### 传输方式
+
+| 项目 | 说明 |
+|------|------|
+| 视频通道 | TCP 9901（`hdc fport` 转发到设备），H.264 Annex-B 裸流 |
+| 控制通道 | TCP 9902，独立传输触摸/按键/工具栏指令 + 心跳 |
+| 帧类型 | `MSG_VIDEO_SPS_PPS`（连接后发一次）→ `MSG_VIDEO_IDR_FRAME` → `MSG_VIDEO_P_FRAME` |
+| 可靠性 | TCP + 本地 USB 转发保证可靠传输，无需额外抗丢包处理 |
+
+#### 编码参数（OpenH264 软编回退路径）
+
+| 参数 | 值 |
+|------|-----|
+| 目标码率 | 4 Mbps（`--bitrate` 可调） |
+| 帧率上限 | 60 fps（`--fps` 可调） |
+| Profile / Level | Baseline / 5.0，CAVLC 熵编码 |
+| 分片 | `SM_FIXEDSLCNUM_SLICE`，4 slices（利于多线程并行） |
+| 线程数 | 4（`iMultipleThreadIdc`） |
+| RC 模式 | `RC_BITRATE_MODE`，禁用跳帧（`bEnableFrameSkip=false`） |
+| SPS/PPS ID | `CONSTANT_ID`（流中途不变化，客户端只需解析一次） |
+
+#### 带宽实测
+
+| 帧类型 | 大小 | 对比 |
+|--------|------|------|
+| RGBA 原始帧（旧方案） | ~10 MB/帧（1080x2408） | USB 带宽打满，画面卡顿 |
+| H.264 IDR 关键帧 | ~70 KB | 降低 99%+ |
+| H.264 P 帧 | 0.4 ~ 1.5 KB | 交互流畅度显著提升 |
+
+实测交互时约 14 fps；静止时 2-6 fps 属正常现象——`AVScreenCapture` 原始流模式是 **damage 驱动**的，屏幕无变化时设备端不产出新帧。
+
+#### 关键实现细节
+
+1. **编码器选择**（[server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c)）：先尝试 OH_AVCodec（Capability 查询 + `CreateByName`/`CreateByMime`）；失败且编译了 `WITH_OPENH264` 时回退 `sw_encoder_create()`（`ctx->useSw` 分支）。
+2. **OpenH264 封装**（[server/src/sw_encoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/sw_encoder.cpp)）：OpenH264 官方仅提供 C++ 接口（`ISVCEncoder` 抽象类），纯 C 无法直接使用（codec_api.h 的 C vtbl 段与实际实现不兼容），故用 C++ 实现并导出 `extern "C"` 接口：`swenc_create` / `swenc_encode` / `swenc_destroy`。内部完成 RGBA(紧凑) → I420 转换（BT.601 full-range）。
+3. **SPS/PPS 提取**：软编路径从首个 IDR 帧的 Annex-B 流中扫描 `00 00 00 01` 起始码，分离 SPS 与 PPS 后经 `MSG_VIDEO_SPS_PPS` 发送（提取失败时下一个关键帧重试）。
+4. **GL 上下文线程安全**（Windows）：GL 上下文同一时刻只能属于一个线程，主线程在 `renderer_create` 中 MakeCurrent 后一直持有。因此视频接收线程**只复制解码帧到共享缓冲**（`g_yuvPlanes` + `g_yuvMutex`），由主循环渲染；在视频线程直接渲染会导致 `SDL_GL_MakeCurrent` 失败，进而所有 GL 调用返回 `GL_INVALID_OPERATION (0x502)`。
+5. **linesize 处理**：FFmpeg 解码输出 YUV420P 的行距（如 1152）可能大于视频宽度（如 1080，因 16/32 字节对齐），上传纹理时使用 `glPixelStorei(GL_UNPACK_ROW_LENGTH, stride)` 跳过对齐填充，避免画面剪切变形。
+
 ---
 
 ## 3. 目录结构
@@ -137,13 +193,19 @@ ohos-scrcpy/
 │   ├── src/                         # 实现文件
 │   │   ├── main.c                   # 服务端主入口
 │   │   ├── screen_capture.c         # AVScreenCapture 实现
-│   │   ├── video_encoder.c          # OH_VideoEncoder 实现
+│   │   ├── video_encoder.c          # 编码器（OH_AVCodec 硬编 → OpenH264 软编回退）
+│   │   ├── sw_encoder.cpp           # OpenH264 C++ 封装（extern "C" 接口）
 │   │   ├── input_injector.c         # OH_Input 动态加载实现
 │   │   └── tcp_server.c             # TCP 监听实现
 │   └── stubs/                       # 桩头文件（用于无 OHOS SDK 时的结构验证编译）
 │       ├── input_injector.h
 │       ├── screen_capture.h
 │       └── video_encoder.h
+│
+├── third_party/                     # 第三方库
+│   └── openh264/                    # OpenH264 v2.x（预编译 aarch64 静态库）
+│       ├── codec/api/wels/          # 头文件（codec_api.h 等）
+│       └── libopenh264.a            # aarch64-linux-ohos 静态库
 │
 └── scripts/                         # 辅助脚本
     ├── build_client.sh              # 客户端构建脚本
@@ -286,7 +348,7 @@ typedef struct __attribute__((packed)) {
 #### 职责
 - 解析命令行参数
 - 协调各子模块的初始化与销毁
-- 主循环：SDL 事件分发、RGBA 帧渲染、FPS 统计
+- 主循环：SDL 事件分发、YUV/RGBA 帧渲染（主线程）、FPS 统计
 - 信号处理（SIGINT/SIGTERM 优雅退出）
 
 #### 关键函数
@@ -295,7 +357,7 @@ typedef struct __attribute__((packed)) {
 |------|------|
 | `parse_args()` | 解析 `-s`、`--scale`、`--bitrate`、`--fps`、`--fullscreen`、`--always-on-top`、`--borderless`、`--video-port`、`--control-port`、`--hdc` 等参数 |
 | `on_video_frame()` | 视频帧回调。根据 `VideoMessageType` 分发：SPS/PPS → 解码器配置；IDR/P → 解码；CONFIG → 更新渲染器/输入器尺寸；RAW_RGBA → 拷贝到缓冲区由主线程渲染 |
-| `on_decoded_frame()` | 解码帧回调，将 YUV420P 数据送入渲染器 |
+| `on_decoded_frame()` | 解码帧回调（视频接收线程）：复制 YUV420P 三平面到共享缓冲 `g_yuvPlanes`（含 stride），由主线程渲染 |
 | `on_control_message()` | 控制消息回调（当前为空实现） |
 | `heartbeat_thread()` | 心跳线程，每 3 秒发送一次心跳 |
 | `signal_handler()` | 信号处理，设置 `g_running = false` |
@@ -307,9 +369,15 @@ typedef struct __attribute__((packed)) {
 static AppConfig g_appConfig;          /* 应用配置 */
 static volatile bool g_running;        /* 运行标志 */
 static bool g_rawRgbaMode;             /* 是否处于 RGBA 降级模式 */
-static uint8_t *g_rgbaBuffer;          /* RGBA 帧缓冲区 */
+static uint8_t *g_rgbaBuffer;          /* RGBA 帧缓冲区（视频线程写，主线程读） */
 static pthread_mutex_t g_rgbaMutex;    /* RGBA 缓冲区互斥锁 */
+static uint8_t *g_yuvPlanes[3];        /* H264 解码 YUV 三平面缓冲（视频线程写，主线程读） */
+static int g_yuvStrides[3];            /* 各平面行距（FFmpeg linesize） */
+static volatile bool g_yuvFrameReady;  /* 新 YUV 帧就绪标志 */
+static pthread_mutex_t g_yuvMutex;     /* YUV 缓冲区互斥锁 */
 ```
+
+> **注意**：Windows 上 GL 上下文同一时刻只能属于一个线程，所有 GL 渲染必须在主线程执行。视频接收线程仅做数据拷贝，详见 [2.3 关键实现细节](#23-视频数据传输方案当前实现)。
 
 #### 主流程
 
@@ -323,7 +391,7 @@ static pthread_mutex_t g_rgbaMutex;    /* RGBA 缓冲区互斥锁 */
 8. 创建 SDL/OpenGL 渲染器
 9. 创建输入处理器
 10. 启动视频/控制接收线程和心跳线程
-11. 主循环：处理 SDL 事件 → 渲染 RGBA 帧（如适用）→ 更新窗口标题 FPS
+11. 主循环：处理 SDL 事件 → 渲染 YUV 帧（H264 模式）或 RGBA 帧（降级模式）→ 更新窗口标题 FPS
 
 ### 5.2 HDC 管理模块 `hdc_manager`
 
@@ -588,19 +656,27 @@ OH_AVScreenCapture_SetMicrophoneEnabled(capture, false);  /* 关闭麦克风 */
 
 ### 6.3 视频编码模块 `video_encoder`
 
-**文件**: [server/include/video_encoder.h](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/include/video_encoder.h), [server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c)
+**文件**: [server/include/video_encoder.h](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/include/video_encoder.h), [server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c), [server/src/sw_encoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/sw_encoder.cpp)
 
 #### 职责
-使用 OpenHarmony `OH_VideoEncoder` 进行 H.264 硬件编码。
+将采集的 RGBA 帧编码为 H.264。采用**双后端架构**：
 
-#### 编码器查找
+1. **优先 OH_AVCodec 硬件编码**（异步回调模式）
+2. **回退 OpenH264 软件编码**（`WITH_OPENH264` 编译选项，`sw_encoder.cpp` 封装）
 
-`find_h264_encoder_name()` 按顺序：
-1. `OH_AVCodec_GetCapability("video/avc", true)` 查询
-2. `OH_AVCodec_GetCapabilityByCategory("video/avc", true, HARDWARE)` 查询硬件编码器
-3. 回退到名称 `"video_encoder.avc"`
+实测设备（如 Unisoc UIS7885）的 OH_AVCodec 公共路径无可用 AVC 编码器（Capability 查询为空、`CreateByMime` 失败；相机 HDI 内部的 vsp 硬编为私有通路，无法复用），因此实际运行通常走 OpenH264 软编回退。
 
-#### 异步回调
+#### 编码器选择
+
+`video_encoder_create()` 流程：
+
+1. `find_h264_encoder_name()`：`OH_AVCodec_GetCapability("video/avc", true)` → `GetCapabilityByCategory(HARDWARE)` → 回退名称 `"video.encoder.avc"`
+2. `CreateByName` / `CreateByMime` 创建硬件编码器
+3. 失败且编译了 `WITH_OPENH264` → `sw_encoder_create()`，置 `ctx->useSw = true`
+
+`video_encoder_start()` / `video_encoder_encode_frame()` / `video_encoder_stop()` / `video_encoder_destroy()` 均按 `useSw` 分支走不同路径。
+
+#### 硬编路径（OH_AVCodec，异步回调）
 
 | 回调 | 说明 |
 |------|------|
@@ -609,14 +685,33 @@ OH_AVScreenCapture_SetMicrophoneEnabled(capture, false);  /* 关闭麦克风 */
 | `on_need_input_data()` | 编码器请求输入数据，记录 `inputIndex` 和 `inputData` |
 | `on_need_output_data()` | 编码器输出数据，构造 `EncodedFrame` 触发 `frameCallback`，释放输出 buffer |
 
-#### 关键函数
+帧数据逐行拷贝到输入 buffer（处理 stride 差异），`PushInputData` 提交。
+
+#### 软编路径（OpenH264）
+
+[server/src/sw_encoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/sw_encoder.cpp) 是 C++ 封装（OpenH264 仅提供 C++ 接口，纯 C 调用其 C vtbl 会崩溃），导出：
+
+| 接口 | 说明 |
+|------|------|
+| `swenc_create(w, h, bitrate, fps, gop)` | `WelsCreateSVCEncoder` + `InitializeExt` 配置（详见 [2.3 编码参数](#23-视频数据传输方案当前实现)），分配 I420 缓冲 |
+| `swenc_encode(rgba, tsUs, onFrame, userData)` | RGBA(紧凑) → I420 转换（BT.601 full-range）→ `EncodeFrame` → 输出帧回调 `onFrame(data, len, isKey, ts)` |
+| `swenc_destroy()` | `WelsDestroySVCEncoder` + 释放缓冲 |
+
+[server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c) 侧：
 
 | 函数 | 说明 |
 |------|------|
-| `video_encoder_create()` | 查找编码器名称，`CreateByName` 或 `CreateByMime`，应用默认配置（码率 4Mbps、60fps、GOP 60、High profile） |
-| `video_encoder_start()` | 配置 `OH_AVFormat`（宽高、像素格式 RGBA、码率、帧率、GOP、profile、低延迟），设置异步回调，`Prepare` + `Start` |
-| `video_encoder_encode_frame()` | 等待 `inputReady`，逐行拷贝帧数据到输入 buffer（处理 stride 差异），`PushInputData` |
-| `video_encoder_request_key_frame()` | 通过 `OH_MD_KEY_REQUEST_I_FRAME` 请求关键帧 |
+| `sw_extract_and_send_sps_pps()` | 从首个 IDR 帧的 Annex-B 流扫描 `00 00 00 01` 起始码，分离 SPS/PPS 后经 `spsPpsCallback` 发送；返回 -1 时下一关键帧重试 |
+| `on_sw_encoded()` | 编码输出回调：首个关键帧提取 SPS/PPS，随后经 `frameCallback` 下发（`MSG_VIDEO_IDR_FRAME` / `MSG_VIDEO_P_FRAME`） |
+
+#### 通用接口
+
+| 函数 | 说明 |
+|------|------|
+| `video_encoder_create()` | 编码器选择（见上） |
+| `video_encoder_start()` | 硬编：配置 `OH_AVFormat` + 回调 + `Prepare`/`Start`；软编：`swenc_create` |
+| `video_encoder_encode_frame()` | 硬编：等待 `inputReady` 后拷贝提交；软编：`swenc_encode` |
+| `video_encoder_request_key_frame()` | 硬编：`OH_MD_KEY_REQUEST_I_FRAME`；软编：暂不支持 |
 | `video_encoder_set_bitrate()` | 动态调整码率 |
 | `video_encoder_stop()` / `video_encoder_destroy()` | 停止并释放资源 |
 
@@ -739,10 +834,12 @@ SERVER_STATE_IDLE → SERVER_STATE_LISTENING → SERVER_STATE_CONNECTED
 | 依赖 | 用途 | 必需 |
 |------|------|------|
 | **OH_AVScreenCapture** (`libnative_avscreen_capture.so`) | 屏幕捕获 | 是 |
-| **OH_VideoEncoder** (`libnative_media_venc.so`) | H.264 编码 | 否（降级到 RGBA） |
+| **OH_VideoEncoder** (`libnative_media_venc.so`) | H.264 硬件编码（优先路径） | 否（回退 OpenH264 软编） |
+| **OpenH264** (`third_party/openh264/libopenh264.a`) | H.264 软件编码回退（`WITH_OPENH264`） | 否（但推荐，保证无硬编设备可用） |
 | **OH_Input** (`libohinput.so`) | 输入注入 | 否（动态加载） |
 | **OH_NativeDisplayManager** (`libnative_display_manager.so`) | 屏幕尺寸查询 | 否（回退到 sysfs） |
 | **OH_NativeBuffer** | 缓冲区映射 | 是 |
+| **c++ / c++abi** | OpenH264 C++ 运行时 | 随软编启用 |
 | **pthread** | 多线程 | 是 |
 | **dl** (dlopen/dlsym) | 动态库加载 | 是 |
 
@@ -758,7 +855,8 @@ SERVER_STATE_IDLE → SERVER_STATE_LISTENING → SERVER_STATE_CONNECTED
 
 服务端:
   main.c ─┬─ screen_capture ─ OH_AVScreenCapture + OH_NativeBuffer
-          ├─ video_encoder ── OH_VideoEncoder
+          ├─ video_encoder ── OH_AVCodec (硬编) ┐
+          │                 ── OpenH264 (软编) ─┤ useSw 分支
           ├─ input_injector ─ OH_Input (dlopen)
           └─ tcp_server ───── POSIX socket + pthread
 ```
@@ -994,20 +1092,21 @@ scripts\start.bat [options]
 4. **跨平台**：客户端通过宏隔离平台差异（`_WIN32` vs Unix），Windows 使用 `CreateProcess`，Unix 使用 `popen`。
 5. **低延迟优化**：`TCP_NODELAY`、禁用 VSync、FFmpeg `zerolatency` tune、编码器 `low_latency` 选项。
 6. **宽高比保持**：渲染器和输入处理器独立计算视口，保证画面不变形且坐标映射正确。
-7. **线程安全**：RGBA 帧通过互斥锁在视频接收线程和主渲染线程间同步，避免 GL 上下文跨线程问题。
+7. **线程安全**：解码 YUV 帧与 RGBA 帧均通过互斥锁在视频接收线程和主渲染线程间同步，避免 GL 上下文跨线程问题（Windows 上 `SDL_GL_MakeCurrent` 跨线程会失败）。
+8. **编码降级链**：OH_AVCodec 硬编 → OpenH264 软编 → RGBA 直传，三级回退保证任意设备可用，同时将带宽从 ~10MB/帧 压缩到 KB 级。
 
 ### 11.2 线程模型
 
 **客户端线程**:
-- 主线程：SDL 事件循环 + RGBA 渲染
-- 视频接收线程：接收视频帧，调用解码器或填充 RGBA 缓冲区
+- 主线程：SDL 事件循环 + 渲染（H264 解码 YUV 帧与降级 RGBA 帧均在此线程渲染，Windows 上 GL 上下文只能属于主线程）
+- 视频接收线程：接收视频帧，调用解码器或填充 RGBA 缓冲区（解码帧复制到 `g_yuvPlanes` 共享缓冲）
 - 控制接收线程：接收控制消息（当前为空实现）
 - 心跳线程：每 3 秒发送心跳
 
 **服务端线程**:
 - 主线程：启动流程 + 主循环（100ms 检查）
 - 控制接收线程：接收控制消息，触发输入注入
-- AVScreenCapture 回调线程：视频帧可用时回调
+- AVScreenCapture 回调线程：视频帧可用时回调（同步执行编码与发送）
 
 ### 11.3 可扩展点
 
@@ -1037,19 +1136,20 @@ scripts\start.bat [options]
 |------|------|------|
 | [common/protocol.h](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/common/protocol.h) | 157 | 通信协议定义 |
 | [common/log.h](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/common/log.h) | 57 | 日志宏 |
-| [client/src/main.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/main.c) | 487 | 客户端主入口 |
+| [client/src/main.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/main.c) | 561 | 客户端主入口 |
 | [client/src/hdc_manager.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/hdc_manager.c) | 342 | HDC 命令封装 |
 | [client/src/tcp_client.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/tcp_client.c) | 385 | TCP 客户端 |
-| [client/src/renderer.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/renderer.c) | 486 | OpenGL 渲染 |
-| [client/src/video_decoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/video_decoder.cpp) | 271 | FFmpeg 解码 |
+| [client/src/renderer.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/renderer.c) | 489 | OpenGL 渲染 |
+| [client/src/video_decoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/video_decoder.cpp) | 227 | FFmpeg 解码 |
 | [client/src/input_handler.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/client/src/input_handler.c) | 190 | 输入处理 |
 | [server/src/main.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/main.c) | 351 | 服务端主入口 |
 | [server/src/screen_capture.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/screen_capture.c) | 270 | 屏幕捕获 |
-| [server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c) | 364 | 视频编码 |
+| [server/src/video_encoder.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/video_encoder.c) | 472 | 视频编码（硬编/软编双后端） |
+| [server/src/sw_encoder.cpp](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/sw_encoder.cpp) | 160 | OpenH264 C++ 封装 |
 | [server/src/input_injector.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/input_injector.c) | 265 | 输入注入 |
 | [server/src/tcp_server.c](file:///e/github/OpenHarmony_USB_Screen_Mirroring_Tool/ohos-scrcpy/server/src/tcp_server.c) | 360 | TCP 服务端 |
 
 ---
 
-*文档生成时间: 2026-06-21*
-*项目版本: 1.0.0*
+*文档生成时间: 2026-06-21，最后更新: 2026-10-30（视频链路改为 H.264 编码传输：OH_AVCodec 硬编 → OpenH264 软编回退，详见 2.3 节）*
+*项目版本: 1.1.0*
