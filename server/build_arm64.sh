@@ -13,14 +13,18 @@ mkdir -p "$BUILD_DIR"
 
 COMMON_FLAGS="--target=$TARGET --sysroot=\"$SYSROOT\" -D__MUSL__ -DOHOS_PLATFORM"
 
+OPENH264_DIR="$SERVER_DIR/../third_party/openh264"
+
 INCLUDES="-I\"$SERVER_DIR/include\" \
   -I\"$SERVER_DIR/../common\" \
+  -I\"$OPENH264_DIR/codec/api/wels\" \
   -I\"$SYSROOT/usr/include\""
 
 SRC_FILES="
   $SERVER_DIR/src/main.c
   $SERVER_DIR/src/screen_capture.c
   $SERVER_DIR/src/video_encoder.c
+  $SERVER_DIR/src/sw_encoder.cpp
   $SERVER_DIR/src/input_injector.c
   $SERVER_DIR/src/tcp_server.c
 "
@@ -32,6 +36,11 @@ LIBS="-lnative_avscreen_capture \
   -lnative_buffer \
   -lpthread"
 
+# OpenH264 软编后端（C++ 静态库，需链接 libc++）
+SW_ENC_FLAGS="-DWITH_OPENH264 \
+  \"$OPENH264_DIR/libopenh264.a\" \
+  -L\"$OHOS_NATIVE/llvm/lib/aarch64-linux-ohos\" -lc++ -lc++abi"
+
 LIB_DIRS="-L\"$SYSROOT/usr/lib/aarch64-linux-ohos\""
 
 echo "=== Cross-compiling ohos_scrcpy_server for aarch64 ==="
@@ -39,7 +48,7 @@ echo "Compiler: $CLANG"
 echo "Target: $TARGET"
 echo ""
 
-eval "\"$CLANG\"" $COMMON_FLAGS $INCLUDES \
+eval "\"$CLANG\"" $COMMON_FLAGS $SW_ENC_FLAGS $INCLUDES \
   -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
   -o "$BUILD_DIR/ohos_scrcpy_server" \
   $SRC_FILES \

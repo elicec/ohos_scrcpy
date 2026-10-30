@@ -17,6 +17,18 @@
 #include <multimedia/player_framework/native_avbuffer_info.h>
 #include <multimedia/player_framework/native_avcapability.h>
 
+#ifdef WITH_OPENH264
+/* OpenH264 软编后端：设备无 AVC 编码器组件时兜底（如 OHarm OS 2.0 老设备）。
+ * 实现在 sw_encoder.cpp（C++ 封装，导出 C 接口），此处仅作声明。 */
+int swenc_create(uint32_t width, uint32_t height,
+                 uint32_t bitrate, uint32_t fps, uint32_t gop);
+int swenc_encode(const uint8_t *rgba, uint64_t timestampUs,
+                 void (*onFrame)(const uint8_t *data, uint32_t len,
+                                 int isKeyFrame, uint64_t tsUs, void *userData),
+                 void *userData);
+void swenc_destroy(void);
+#endif
+
 #define ENCODER_TAG "Encoder"
 
 typedef struct {
@@ -33,6 +45,11 @@ typedef struct {
     uint32_t              inputIndex;
     OH_AVMemory          *inputData;
     bool                  inputReady;
+#ifdef WITH_OPENH264
+    /* OpenH264 软编后端（编码器实例与 I420 缓冲由 sw_encoder.cpp 管理） */
+    bool                  useSw;
+    bool                  swSpsPpsSent;  /* 是否已向客户端发送过 SPS/PPS */
+#endif
 } EncoderContext;
 
 static EncoderContext g_encoderCtx = {0};
@@ -82,6 +99,132 @@ static const char* find_h264_encoder_name(void)
     LOG_TAG_E(ENCODER_TAG, "All H.264 capability queries failed, will try CreateByMime fallback");
     return NULL;
 }
+
+#ifdef WITH_OPENH264
+
+/* 从 Annex-B 码流中提取首个 SPS/PPS，通过回调发送给客户端初始化解码器。
+ * 返回 0 成功，-1 失败（失败时调用方可对下一个关键帧重试）。 */
+static int sw_extract_and_send_sps_pps(const uint8_t *data, uint32_t length)
+{
+    const uint8_t *sps = NULL, *pps = NULL;
+    uint32_t spsLen = 0, ppsLen = 0;
+    uint32_t i = 0;
+
+    while (i + 4 < length) {
+        uint32_t scLen = 0;
+        if (data[i] == 0 && data[i + 1] == 0) {
+            if (data[i + 2] == 1) {
+                scLen = 3;
+            } else if (data[i + 2] == 0 && i + 3 < length && data[i + 3] == 1) {
+                scLen = 4;
+            }
+        }
+        if (scLen == 0) {
+            i++;
+            continue;
+        }
+
+        uint32_t nalStart = i + scLen;
+        uint32_t nalEnd = length;
+        uint32_t j = nalStart;
+        while (j + 2 < length) {
+            if (data[j] == 0 && data[j + 1] == 0 &&
+                (data[j + 2] == 1 || (data[j + 2] == 0 && j + 3 < length && data[j + 3] == 1))) {
+                nalEnd = j;
+                break;
+            }
+            j++;
+        }
+
+        uint32_t nalLen = nalEnd - nalStart;
+        if (nalLen > 0) {
+            uint8_t type = data[nalStart] & 0x1F;
+            if (type == 7 && sps == NULL) {
+                sps = data + nalStart;
+                spsLen = nalLen;
+            } else if (type == 8 && pps == NULL) {
+                pps = data + nalStart;
+                ppsLen = nalLen;
+            }
+        }
+        if (sps && pps) break;
+        i = nalEnd;
+    }
+
+    if (sps == NULL || pps == NULL || spsLen == 0 || ppsLen == 0) {
+        LOG_TAG_W(ENCODER_TAG, "No SPS/PPS found in first keyframe (%u bytes)", length);
+        return -1;
+    }
+
+    if (g_encoderCtx.spsPps.spsData) free(g_encoderCtx.spsPps.spsData);
+    if (g_encoderCtx.spsPps.ppsData) free(g_encoderCtx.spsPps.ppsData);
+    g_encoderCtx.spsPps.spsData = (uint8_t *)malloc(spsLen);
+    g_encoderCtx.spsPps.ppsData = (uint8_t *)malloc(ppsLen);
+    if (g_encoderCtx.spsPps.spsData == NULL || g_encoderCtx.spsPps.ppsData == NULL) {
+        return -1;
+    }
+    memcpy(g_encoderCtx.spsPps.spsData, sps, spsLen);
+    g_encoderCtx.spsPps.spsLength = spsLen;
+    memcpy(g_encoderCtx.spsPps.ppsData, pps, ppsLen);
+    g_encoderCtx.spsPps.ppsLength = ppsLen;
+
+    LOG_TAG_I(ENCODER_TAG, "OpenH264 SPS(%u) PPS(%u) extracted", spsLen, ppsLen);
+    if (g_encoderCtx.spsPpsCallback) {
+        g_encoderCtx.spsPpsCallback(&g_encoderCtx.spsPps,
+                                    g_encoderCtx.spsPpsUserData);
+    }
+    return 0;
+}
+
+/* swenc_encode 的编码输出回调：首个关键帧提取 SPS/PPS 发给客户端，随后转发编码帧 */
+static void on_sw_encoded(const uint8_t *data, uint32_t len,
+                          int isKeyFrame, uint64_t tsUs, void *userData)
+{
+    EncoderContext *ctx = &g_encoderCtx;
+    (void)userData;
+
+    if (isKeyFrame && !ctx->swSpsPpsSent) {
+        if (sw_extract_and_send_sps_pps(data, len) == 0) {
+            ctx->swSpsPpsSent = true;
+        }
+    }
+
+    if (ctx->frameCallback) {
+        EncodedFrame out = {0};
+        out.data = (uint8_t *)data; /* 回调数据仅用于发送，不会修改 */
+        out.length = len;
+        out.timestamp = tsUs;
+        out.isKeyFrame = isKeyFrame != 0;
+        ctx->frameCallback(&out, ctx->frameUserData);
+    }
+}
+
+/* 创建 OpenH264 软件编码器（实际工作由 sw_encoder.cpp 完成） */
+static int sw_encoder_create(void)
+{
+    EncoderContext *ctx = &g_encoderCtx;
+
+    if (swenc_create(ctx->config.width, ctx->config.height,
+                     ctx->config.bitrate, ctx->config.fps,
+                     ctx->config.gopSize) != 0) {
+        LOG_TAG_E(ENCODER_TAG, "OpenH264 swenc_create failed");
+        return -1;
+    }
+
+    ctx->useSw = true;
+    LOG_TAG_I(ENCODER_TAG, "OpenH264 software encoder ready (%ux%u, %ufps, %ubps)",
+              ctx->config.width, ctx->config.height,
+              ctx->config.fps, ctx->config.bitrate);
+    return 0;
+}
+
+/* OpenH264 软编一帧 RGBA（RGBA->I420 转换与编码均在 sw_encoder.cpp 内完成） */
+static int sw_encode_frame(CapturedFrame *frame)
+{
+    return swenc_encode(frame->data, frame->timestamp, on_sw_encoded, NULL);
+}
+
+#endif /* WITH_OPENH264 */
 
 static void on_error(OH_AVCodec *codec, int32_t errorCode, void *userData)
 {
@@ -210,6 +353,14 @@ int video_encoder_create(const VideoEncoderConfig *config)
     g_encoderCtx.encoder = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
     if (g_encoderCtx.encoder == NULL) {
         LOG_TAG_E(ENCODER_TAG, "Failed to create encoder by mime AVC");
+#ifdef WITH_OPENH264
+        /* 系统 AVC 编码器不可用，回退到 OpenH264 软件编码 */
+        LOG_TAG_W(ENCODER_TAG, "Falling back to OpenH264 software encoder");
+        if (sw_encoder_create() == 0) {
+            return 0;
+        }
+        LOG_TAG_E(ENCODER_TAG, "OpenH264 software encoder create failed");
+#endif
         return -1;
     }
     LOG_TAG_I(ENCODER_TAG, "Encoder created by mime AVC (%ux%u)",
@@ -235,6 +386,16 @@ int video_encoder_start(void)
     if (g_encoderCtx.running) {
         return 0;
     }
+
+#ifdef WITH_OPENH264
+    if (g_encoderCtx.useSw) {
+        /* OpenH264 软编无需 configure/prepare，直接标记运行 */
+        g_encoderCtx.running = true;
+        g_encoderCtx.firstFrame = true;
+        LOG_TAG_I(ENCODER_TAG, "OpenH264 software encoder started");
+        return 0;
+    }
+#endif
 
     OH_AVFormat *format = OH_AVFormat_Create();
     OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, (int32_t)g_encoderCtx.config.width);
@@ -295,6 +456,12 @@ int video_encoder_encode_frame(CapturedFrame *frame)
     if (!g_encoderCtx.running || frame == NULL) {
         return -1;
     }
+
+#ifdef WITH_OPENH264
+    if (g_encoderCtx.useSw) {
+        return sw_encode_frame(frame);
+    }
+#endif
 
     if (!g_encoderCtx.inputReady || g_encoderCtx.inputData == NULL) {
         return -1;
@@ -361,6 +528,12 @@ int video_encoder_stop(void)
     if (!g_encoderCtx.running) return 0;
 
     g_encoderCtx.running = false;
+#ifdef WITH_OPENH264
+    if (g_encoderCtx.useSw) {
+        LOG_TAG_I(ENCODER_TAG, "OpenH264 encoder stopped");
+        return 0;
+    }
+#endif
     OH_VideoEncoder_Stop(g_encoderCtx.encoder);
 
     LOG_TAG_I(ENCODER_TAG, "Encoder stopped");
@@ -370,6 +543,13 @@ int video_encoder_stop(void)
 void video_encoder_destroy(void)
 {
     video_encoder_stop();
+
+#ifdef WITH_OPENH264
+    if (g_encoderCtx.useSw) {
+        swenc_destroy();
+        g_encoderCtx.useSw = false;
+    }
+#endif
 
     if (g_encoderCtx.encoder) {
         OH_VideoEncoder_Destroy(g_encoderCtx.encoder);
