@@ -742,6 +742,31 @@ int input_injector_inject_home_key(void)
     return -1;
 }
 
+/* 最近任务键：OHOS 没有可用的"最近任务"注入 keycode（KEYCODE_VIRTUAL_MULTITASK
+ * 2210 经 uitest/uinput 注入渠道均不生效），三键导航模式下直接模拟点击
+ * 导航栏最近任务软键。软键位置按实测布局推算：三键在导航栏内水平均布、
+ * 居中放置，最近任务键在最右，导航栏高度约 108px。
+ * 实测 1080x2408 设备：软键中心 (770, 2354)，即 x≈0.713w、y=h-54。 */
+int input_injector_inject_recents_key(void)
+{
+    uint32_t w = g_uinput.screenWidth;
+    uint32_t h = g_uinput.screenHeight;
+    if (w == 0 || h == 0) return -1;
+
+    uint32_t x = w * 713 / 1000;
+    uint32_t y = h - 54;
+    if (y > h) y = 0;
+
+    LOG_TAG_I(INPUT_TAG, "inject recents key via soft key tap at (%u, %u)", x, y);
+
+    TouchEvent down = { .action = PROTO_TOUCH_DOWN, .x = x, .y = y, .pointerId = 0 };
+    TouchEvent up   = { .action = PROTO_TOUCH_UP,   .x = x, .y = y, .pointerId = 0 };
+    input_injector_inject_touch(&down);
+    usleep(80000);  /* 模拟真实点击按压时长，过短可能被手势识别过滤 */
+    input_injector_inject_touch(&up);
+    return 0;
+}
+
 int input_injector_inject_power_key(void)
 {
     if (g_ohInput.available) {

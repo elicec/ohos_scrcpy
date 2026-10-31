@@ -41,6 +41,9 @@ int input_injector_inject_back_key(void);
 /* 注入主页键 */
 int input_injector_inject_home_key(void);
 
+/* 注入最近任务键（模拟点击导航栏最近任务软键） */
+int input_injector_inject_recents_key(void);
+
 /* 注入电源键 */
 int input_injector_inject_power_key(void);
 

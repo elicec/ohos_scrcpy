@@ -75,6 +75,7 @@ typedef enum {
     MSG_CTRL_POWER       = 0x42,  /* 电源键 */
     MSG_CTRL_VOLUME_UP   = 0x43,  /* 音量+ */
     MSG_CTRL_VOLUME_DOWN = 0x44,  /* 音量- */
+    MSG_CTRL_RECENTS     = 0x45,  /* 最近任务（多任务）键 */
     MSG_CTRL_SET_SCREEN_SIZE = 0x50, /* 设置屏幕尺寸 */
     MSG_CTRL_HEARTBEAT  = 0xFF,  /* 心跳 */
 } ControlMessageType;

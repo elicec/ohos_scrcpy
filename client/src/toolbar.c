@@ -76,7 +76,7 @@ static const float COLOR_TEXT_ACTIVE[4] = {0.08f, 0.08f, 0.08f, 1.0f};
 
 /* 按钮文字标签（与 ToolbarAction 枚举顺序一一对应） */
 static const wchar_t *BUTTON_LABELS[TOOLBAR_ACTION_COUNT] = {
-    L"返回", L"主页", L"电源", L"音量+", L"音量-", L"截图",
+    L"返回", L"主页", L"多任务", L"电源", L"音量+", L"音量-", L"截图",
 };
 
 typedef struct {
@@ -366,6 +366,18 @@ static void draw_volume_down_icon(const ToolbarButton *btn)
     draw_rect(cx - barH / 2, cy - barW / 2, barH, barW);
 }
 
+static void draw_recents_icon(const ToolbarButton *btn)
+{
+    int cx = btn->x + btn->width / 2;
+    int cy = btn->y + (btn->height - LABEL_HEIGHT) / 2;
+    int size = btn->width / 2 - ICON_MARGIN;
+    int x = cx - size / 2;
+    int y = cy - size / 2;
+
+    /* 最近任务图标：方块轮廓（与系统导航栏软键样式一致） */
+    draw_rect_lines(x, y, size, size, 3);
+}
+
 static void draw_screenshot_icon(const ToolbarButton *btn)
 {
     int cx = btn->x + btn->width / 2;
@@ -386,6 +398,7 @@ static void draw_button_icon(ToolbarAction action, const ToolbarButton *btn)
     switch (action) {
         case TOOLBAR_ACTION_BACK:         draw_back_icon(btn); break;
         case TOOLBAR_ACTION_HOME:         draw_home_icon(btn); break;
+        case TOOLBAR_ACTION_RECENTS:      draw_recents_icon(btn); break;
         case TOOLBAR_ACTION_POWER:        draw_power_icon(btn); break;
         case TOOLBAR_ACTION_VOLUME_UP:    draw_volume_up_icon(btn); break;
         case TOOLBAR_ACTION_VOLUME_DOWN:  draw_volume_down_icon(btn); break;

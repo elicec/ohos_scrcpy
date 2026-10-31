@@ -293,6 +293,10 @@ static void handle_toolbar_action(ToolbarAction action)
             LOG_TAG_I(MAIN_TAG, "Toolbar: home");
             tcp_client_send_system_key(MSG_CTRL_HOME);
             break;
+        case TOOLBAR_ACTION_RECENTS:
+            LOG_TAG_I(MAIN_TAG, "Toolbar: recents");
+            tcp_client_send_system_key(MSG_CTRL_RECENTS);
+            break;
         case TOOLBAR_ACTION_POWER:
             LOG_TAG_I(MAIN_TAG, "Toolbar: power");
             tcp_client_send_system_key(MSG_CTRL_POWER);

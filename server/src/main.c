@@ -93,6 +93,9 @@ static void on_control_message(const ControlHeader *header,
         case MSG_CTRL_HOME:
             input_injector_inject_home_key();
             break;
+        case MSG_CTRL_RECENTS:
+            input_injector_inject_recents_key();
+            break;
         case MSG_CTRL_POWER:
             input_injector_inject_power_key();
             break;
