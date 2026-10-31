@@ -81,6 +81,12 @@ static struct {
 #define KEYCODE_VOLUME_UP   16
 #define KEYCODE_VOLUME_DOWN 17
 
+/* Linux "home" 键 (102) 是"光标移到行首"，经 OHOS 多模输入服务转换后
+ * 不会触发回桌面；真正的"主页"键是 KEY_HOMEPAGE (172)，实测有效 */
+#ifndef KEY_HOMEPAGE
+#define KEY_HOMEPAGE 172
+#endif
+
 #define NDK_TOUCH_DOWN  1
 #define NDK_TOUCH_MOVE  2
 #define NDK_TOUCH_UP    3
@@ -730,8 +736,8 @@ int input_injector_inject_home_key(void)
         return ohinput_inject_key_event(KEYCODE_HOME, NDK_KEY_UP);
     }
     if (g_uinput.keyAvailable) {
-        uinput_inject_key(KEY_HOME, NDK_KEY_DOWN);
-        return uinput_inject_key(KEY_HOME, NDK_KEY_UP);
+        uinput_inject_key(KEY_HOMEPAGE, NDK_KEY_DOWN);
+        return uinput_inject_key(KEY_HOMEPAGE, NDK_KEY_UP);
     }
     return -1;
 }
