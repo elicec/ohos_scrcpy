@@ -55,7 +55,7 @@ target_link_libraries(${PROJECT_NAME}
 
 # Windows 特定链接
 if(WIN32)
-    target_link_libraries(${PROJECT_NAME} ws2_32 opengl32)
+    target_link_libraries(${PROJECT_NAME} ws2_32 opengl32 gdi32)
 endif()
 
 # Linux 特定链接
